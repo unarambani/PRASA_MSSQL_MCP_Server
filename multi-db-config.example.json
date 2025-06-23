@@ -1,0 +1,79 @@
+{
+  "databases": [
+    {
+      "id": "kzn",
+      "name": "KwaZulu-Natal",
+      "server": "${KZN_SERVER}",
+      "database": "${KZN_DB}",
+      "user": "${KZN_USER}",
+      "password": "${KZN_PASSWORD}",
+      "port": 1433,
+      "options": {
+        "encrypt": true,
+        "trustServerCertificate": false,
+        "connectionTimeout": 15000,
+        "requestTimeout": 15000
+      }
+    },
+    {
+      "id": "gp",
+      "name": "Gauteng",
+      "server": "${GP_SERVER}",
+      "database": "${GP_DB}",
+      "user": "${GP_USER}",
+      "password": "${GP_PASSWORD}",
+      "port": 1433,
+      "options": {
+        "encrypt": true,
+        "trustServerCertificate": false,
+        "connectionTimeout": 15000,
+        "requestTimeout": 15000
+      }
+    },
+    {
+      "id": "el",
+      "name": "Eastern Cape",
+      "server": "${EL_SERVER}",
+      "database": "${EL_DB}",
+      "user": "${EL_USER}",
+      "password": "${EL_PASSWORD}",
+      "port": 1433,
+      "options": {
+        "encrypt": true,
+        "trustServerCertificate": false,
+        "connectionTimeout": 15000,
+        "requestTimeout": 15000
+      }
+    },
+    {
+      "id": "pe",
+      "name": "Port Elizabeth",
+      "server": "${PE_SERVER}",
+      "database": "${PE_DB}",
+      "user": "${PE_USER}",
+      "password": "${PE_PASSWORD}",
+      "port": 1433,
+      "options": {
+        "encrypt": true,
+        "trustServerCertificate": false,
+        "connectionTimeout": 15000,
+        "requestTimeout": 15000
+      }
+    },
+    {
+      "id": "cpt",
+      "name": "Cape Town",
+      "server": "${CPT_SERVER}",
+      "database": "${CPT_DB}",
+      "user": "${CPT_USER}",
+      "password": "${CPT_PASSWORD}",
+      "port": 1433,
+      "options": {
+        "encrypt": true,
+        "trustServerCertificate": false,
+        "connectionTimeout": 15000,
+        "requestTimeout": 15000
+      }
+    }
+  ]
+} 

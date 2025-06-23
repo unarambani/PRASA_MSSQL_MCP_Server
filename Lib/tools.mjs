@@ -5,7 +5,17 @@ import path from 'path';
 import crypto from 'crypto';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
-import { executeQuery, tableExists, sanitizeSqlIdentifier, formatSqlError } from './database.mjs';
+import { 
+    executeQuery, 
+    tableExists, 
+    sanitizeSqlIdentifier, 
+    formatSqlError,
+    registerDatabase,
+    getRegisteredDatabases,
+    switchDatabase,
+    getCurrentDatabaseId,
+    executeQueryOnMultipleDatabases
+} from './database.mjs';
 // Import new pagination utilities
 import { 
     paginateQuery, 
@@ -77,8 +87,282 @@ function registerDatabaseTools(server) {
     registerPaginatedQueryTool(server, registerWithAllAliases);
     registerQueryStreamerTool(server, registerWithAllAliases);
     
+    // Register new multi-database tools
+    registerDatabaseManagementTools(server, registerWithAllAliases);
+    
     // Log registered tools for debugging
     logger.info(`Registered tools: ${Object.keys(server._tools).join(", ")}`);
+}
+
+/**
+ * Register database management tools for multi-database support
+ * @param {object} server - MCP server instance
+ * @param {function} registerWithAllAliases - Helper to register with all name variants
+ */
+function registerDatabaseManagementTools(server, registerWithAllAliases) {
+    // Register new database connection
+    registerWithAllAliases("register_database", {
+        databaseId: z.string().min(1, "Database ID cannot be empty"),
+        server: z.string().min(1, "Server cannot be empty"),
+        database: z.string().min(1, "Database name cannot be empty"),
+        user: z.string().min(1, "Username cannot be empty"),
+        password: z.string().min(1, "Password cannot be empty"),
+        port: z.number().optional().default(1433),
+        encrypt: z.boolean().optional().default(false),
+        trustServerCertificate: z.boolean().optional().default(true)
+    }, async (args) => {
+        const { databaseId, server: serverName, database, user, password, port, encrypt, trustServerCertificate } = args;
+        
+        try {
+            const config = {
+                user,
+                password,
+                server: serverName,
+                database,
+                port,
+                options: {
+                    encrypt,
+                    trustServerCertificate
+                }
+            };
+            
+            const success = registerDatabase(databaseId, config);
+            
+            if (success) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `✅ Successfully registered database: ${databaseId} (${serverName}/${database})`
+                    }],
+                    result: {
+                        databaseId,
+                        server: serverName,
+                        database,
+                        registered: true
+                    }
+                };
+            } else {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `❌ Failed to register database: ${databaseId}`
+                    }],
+                    isError: true
+                };
+            }
+        } catch (err) {
+            logger.error(`Failed to register database ${databaseId}: ${err.message}`);
+            return {
+                content: [{
+                    type: "text",
+                    text: `❌ Error registering database: ${err.message}`
+                }],
+                isError: true
+            };
+        }
+    });
+    
+    // List registered databases
+    registerWithAllAliases("list_databases", {}, async (args) => {
+        try {
+            const databases = getRegisteredDatabases();
+            const currentDb = getCurrentDatabaseId();
+            
+            let responseText = `🗄️ Registered Databases (${databases.length}):\n\n`;
+            
+            databases.forEach(db => {
+                const status = db.isConnected ? '🟢 Connected' : '🔴 Disconnected';
+                const current = db.id === currentDb ? ' (CURRENT)' : '';
+                responseText += `• ${db.id}${current}\n`;
+                responseText += `  Server: ${db.server}\n`;
+                responseText += `  Database: ${db.database}\n`;
+                responseText += `  User: ${db.user}\n`;
+                responseText += `  Status: ${status}\n\n`;
+            });
+            
+            if (databases.length === 0) {
+                responseText = "No databases are registered.";
+            }
+            
+            return {
+                content: [{
+                    type: "text",
+                    text: responseText
+                }],
+                result: {
+                    databases,
+                    currentDatabase: currentDb,
+                    count: databases.length
+                }
+            };
+        } catch (err) {
+            logger.error(`Failed to list databases: ${err.message}`);
+            return {
+                content: [{
+                    type: "text",
+                    text: `❌ Error listing databases: ${err.message}`
+                }],
+                isError: true
+            };
+        }
+    });
+    
+    // Switch database
+    registerWithAllAliases("switch_database", {
+        databaseId: z.string().min(1, "Database ID cannot be empty")
+    }, async (args) => {
+        const { databaseId } = args;
+        
+        try {
+            const success = switchDatabase(databaseId);
+            
+            if (success) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `✅ Switched to database: ${databaseId}`
+                    }],
+                    result: {
+                        currentDatabase: databaseId,
+                        switched: true
+                    }
+                };
+            } else {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `❌ Failed to switch to database: ${databaseId}. Database not found.`
+                    }],
+                    isError: true
+                };
+            }
+        } catch (err) {
+            logger.error(`Failed to switch database to ${databaseId}: ${err.message}`);
+            return {
+                content: [{
+                    type: "text",
+                    text: `❌ Error switching database: ${err.message}`
+                }],
+                isError: true
+            };
+        }
+    });
+    
+    // Get current database
+    registerWithAllAliases("current_database", {}, async (args) => {
+        try {
+            const currentDb = getCurrentDatabaseId();
+            const databases = getRegisteredDatabases();
+            const dbInfo = databases.find(db => db.id === currentDb);
+            
+            let responseText = `📍 Current Database: ${currentDb}\n\n`;
+            
+            if (dbInfo) {
+                responseText += `Server: ${dbInfo.server}\n`;
+                responseText += `Database: ${dbInfo.database}\n`;
+                responseText += `User: ${dbInfo.user}\n`;
+                responseText += `Status: ${dbInfo.isConnected ? '🟢 Connected' : '🔴 Disconnected'}`;
+            } else {
+                responseText += "Database information not available.";
+            }
+            
+            return {
+                content: [{
+                    type: "text",
+                    text: responseText
+                }],
+                result: {
+                    currentDatabase: currentDb,
+                    databaseInfo: dbInfo
+                }
+            };
+        } catch (err) {
+            logger.error(`Failed to get current database: ${err.message}`);
+            return {
+                content: [{
+                    type: "text",
+                    text: `❌ Error getting current database: ${err.message}`
+                }],
+                isError: true
+            };
+        }
+    });
+    
+    // Execute query on multiple databases
+    registerWithAllAliases("execute_multi_query", {
+        sql: z.string().min(1, "SQL query cannot be empty"),
+        databaseIds: z.array(z.string()).min(1, "At least one database ID is required"),
+        parameters: z.record(z.any()).optional(),
+        maxRows: z.number().min(1).max(10000).optional().default(1000)
+    }, async (args) => {
+        const { sql, databaseIds, parameters = {}, maxRows = 1000 } = args;
+        
+        // Basic validation to prevent destructive operations
+        const lowerSql = sql.toLowerCase();
+        const prohibitedOperations = ['drop ', 'delete ', 'truncate ', 'update ', 'alter '];
+        
+        if (prohibitedOperations.some(op => lowerSql.includes(op))) {
+            return {
+                content: [{
+                    type: "text",
+                    text: "⚠️ Error: Data modification operations (DROP, DELETE, UPDATE, TRUNCATE, ALTER) are not allowed for safety reasons."
+                }],
+                isError: true
+            };
+        }
+        
+        try {
+            logger.info(`Executing SQL on multiple databases: ${databaseIds.join(', ')}`);
+            const startTime = Date.now();
+            const results = await executeQueryOnMultipleDatabases(sql, databaseIds, parameters);
+            const totalTime = Date.now() - startTime;
+            
+            let responseText = `🔍 Multi-Database Query Results (${results.length} databases)\n\n`;
+            responseText += `Query: ${sql.length > 100 ? sql.substring(0, 100) + '...' : sql}\n`;
+            responseText += `Total Execution Time: ${totalTime}ms\n\n`;
+            
+            let totalRows = 0;
+            let successCount = 0;
+            
+            results.forEach(result => {
+                if (result.success) {
+                    successCount++;
+                    const rows = result.result.recordset?.length || 0;
+                    totalRows += rows;
+                    responseText += `✅ ${result.databaseId} (${result.server}/${result.database}): ${rows} rows in ${result.result.executionTime}ms\n`;
+                } else {
+                    responseText += `❌ ${result.databaseId} (${result.server}/${result.database}): ${result.error}\n`;
+                }
+            });
+            
+            responseText += `\n📊 Summary: ${successCount}/${results.length} databases succeeded, ${totalRows} total rows returned`;
+            
+            return {
+                content: [{
+                    type: "text",
+                    text: responseText
+                }],
+                result: {
+                    results,
+                    summary: {
+                        totalDatabases: results.length,
+                        successfulDatabases: successCount,
+                        totalRows,
+                        totalExecutionTime: totalTime
+                    }
+                }
+            };
+        } catch (err) {
+            logger.error(`Multi-database query failed: ${err.message}`);
+            return {
+                content: [{
+                    type: "text",
+                    text: `❌ Error executing multi-database query: ${formatSqlError(err)}`
+                }],
+                isError: true
+            };
+        }
+    });
 }
 
 /**
@@ -92,6 +376,7 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
             returnResults: z.boolean().optional().default(false),
             maxRows: z.number().min(1).max(10000).optional().default(1000),
             parameters: z.record(z.any()).optional(),
+            databaseId: z.string().optional(),
             // Pagination parameters
             pageSize: z.number().min(1).max(1000).optional(),
             cursor: z.string().optional(),
@@ -105,6 +390,7 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
             returnResults = false, 
             maxRows = 1000, 
             parameters = {},
+            databaseId,
             pageSize,
             cursor,
             cursorField,
@@ -136,7 +422,7 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
             // Execute the query
             logger.info(`Executing SQL: ${sql}`);
             const startTime = Date.now();
-            const result = await executeQuery(sql, parameters);
+            const result = await executeQuery(sql, parameters, 3, databaseId);
             const executionTime = Date.now() - startTime;
                 const rowCount = result.recordset?.length || 0;
             logger.info(`SQL executed successfully in ${executionTime}ms, returned ${rowCount} rows`);
@@ -155,6 +441,33 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
                     // Add sample of column names
                     if (result.recordset && result.recordset.length > 0) {
                         responseText += `Columns: ${Object.keys(result.recordset[0]).join(', ')}\n\n`;
+                        
+                        // If returnResults is true, include the actual data in the response
+                        if (returnResults) {
+                            responseText += `Data:\n`;
+                            
+                            // Create a formatted table of results
+                            const columns = Object.keys(result.recordset[0]);
+                            const maxRowsToShow = Math.min(rowCount, maxRows);
+                            
+                            // Header row
+                            responseText += columns.join(' | ') + '\n';
+                            responseText += columns.map(() => '---').join(' | ') + '\n';
+                            
+                            // Data rows
+                            for (let i = 0; i < maxRowsToShow; i++) {
+                                const row = result.recordset[i];
+                                const rowValues = columns.map(col => {
+                                    const value = row[col];
+                                    return value === null ? 'NULL' : String(value);
+                                });
+                                responseText += rowValues.join(' | ') + '\n';
+                            }
+                            
+                            if (rowCount > maxRows) {
+                                responseText += `\n... (showing first ${maxRows} of ${rowCount} rows)\n`;
+                            }
+                        }
                     }
             }
             
@@ -205,10 +518,11 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
  */
 function registerTableDetailsTool(server, registerWithAllAliases) {
     const schema = { 
-        tableName: z.string().min(1, "Table name cannot be empty") 
+        tableName: z.string().min(1, "Table name cannot be empty"),
+        databaseId: z.string().optional()
     };
     
-    const handler = async ({ tableName }) => {
+    const handler = async ({ tableName, databaseId }) => {
         try {
             // Parse schema and table name
             let schemaName = 'dbo'; // Default schema
@@ -254,7 +568,7 @@ function registerTableDetailsTool(server, registerWithAllAliases) {
             `, { 
                 schemaName: sanitizedSchema,
                 tableName: sanitizedTable
-            });
+            }, 3, databaseId);
                 
                 if (result.recordset.length === 0) {
                     return {
@@ -316,7 +630,7 @@ function registerTableDetailsTool(server, registerWithAllAliases) {
  * @param {function} registerWithAlias - Optional helper to register with aliases
  */
 function registerProcedureDetailsTool(server, registerWithAlias) {
-    const handler = async ({ procedureName }) => {
+    const handler = async ({ procedureName, databaseId }) => {
             try {
                 // Sanitize procedure name
                 const sanitizedProcName = sanitizeSqlIdentifier(procedureName);
@@ -339,7 +653,7 @@ function registerProcedureDetailsTool(server, registerWithAlias) {
                     WHERE 
                         ROUTINE_TYPE = 'PROCEDURE' AND
                         ROUTINE_NAME = @procedureName
-                `, { procedureName: sanitizedProcName });
+                `, { procedureName: sanitizedProcName }, 3, databaseId);
                 
                 if (result.recordset.length === 0) {
                     return {
@@ -363,7 +677,7 @@ function registerProcedureDetailsTool(server, registerWithAlias) {
                         SPECIFIC_NAME = @procedureName
                     ORDER BY 
                         ORDINAL_POSITION
-                `, { procedureName: sanitizedProcName });
+                `, { procedureName: sanitizedProcName }, 3, databaseId);
                 
                 let markdown = `# Stored Procedure: ${sanitizedProcName}\n\n`;
                 
@@ -409,7 +723,8 @@ function registerProcedureDetailsTool(server, registerWithAlias) {
     };
 
     const schema = { 
-        procedureName: z.string().min(1, "Procedure name cannot be empty") 
+        procedureName: z.string().min(1, "Procedure name cannot be empty"),
+        databaseId: z.string().optional()
     };
     
     if (registerWithAlias) {

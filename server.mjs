@@ -19,6 +19,9 @@ import { rateLimit } from 'express-rate-limit';
 // Import database utilities
 import { initializeDbPool, executeQuery, getDbConfig } from './Lib/database.mjs';
 
+// Import multi-database configuration loader
+import { loadMultiDatabaseConfig } from './load-multi-db-config.mjs';
+
 // Import tool implementations
 import { registerDatabaseTools } from './Lib/tools.mjs';
 
@@ -133,6 +136,14 @@ server.executeToolCall = async function (toolName, args) {
         throw err;
     }
 };
+
+// Load multi-database configuration if available
+try {
+    logger.info("Checking for multi-database configuration...");
+    await loadMultiDatabaseConfig();
+} catch (error) {
+    logger.info("No multi-database configuration found or failed to load. Using default configuration.");
+}
 
 // IMPORTANT: Register database tools BEFORE setting up HTTP routes
 try {
@@ -684,7 +695,8 @@ const prevPage = await tool.call("mcp_paginated_query", {
                 // Execute the tool and get result
                 server.executeToolCall(foundToolName, toolArgs)
                     .then(result => {
-                        logger.info(`Direct tool result obtained successfully`);
+                        logger.info(`Direct tool result obtained successfully for ${foundToolName}`);
+                        logger.info(`Result type: ${typeof result}, has content: ${!!result.content}`);
 
                         // Send result via SSE transport
                         if (currentTransport && currentTransport.res && !currentTransport.res.finished) {
@@ -698,9 +710,15 @@ const prevPage = await tool.call("mcp_paginated_query", {
                             // Write directly to the SSE connection with event: message format
                             currentTransport.res.write(`event: message\n`);
                             currentTransport.res.write(`data: ${JSON.stringify(sseResponse)}\n\n`);
+                            
+                            // Ensure the data is flushed immediately
+                            if (typeof currentTransport.res.flush === 'function') {
+                                currentTransport.res.flush();
+                            }
 
                             // Respond to HTTP request
-                            res.status(200).json({ success: true });
+                            res.status(200).json({ success: true, sent: 'sse' });
+                            logger.info(`SSE response sent for request ID: ${requestId}`);
                         } else {
                             // Fallback to HTTP response if SSE not available
                             res.status(200).json({
@@ -726,6 +744,11 @@ const prevPage = await tool.call("mcp_paginated_query", {
 
                             currentTransport.res.write(`event: message\n`);
                             currentTransport.res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
+                            
+                            // Ensure the data is flushed immediately
+                            if (typeof currentTransport.res.flush === 'function') {
+                                currentTransport.res.flush();
+                            }
 
                             res.status(200).json({ success: true });
                         } else {
@@ -788,6 +811,11 @@ const prevPage = await tool.call("mcp_paginated_query", {
                         // Write the message with event: message format as per GitHub reference
                         this.res.write(`event: message\n`);
                         this.res.write(`data: ${JSON.stringify(message)}\n\n`);
+                        
+                        // Ensure the data is flushed immediately
+                        if (typeof this.res.flush === 'function') {
+                            this.res.flush();
+                        }
 
                         // No need for separate completion event with this format
                         logger.info(`Sent message event for request ID: ${message.id}`);
@@ -833,6 +861,42 @@ const prevPage = await tool.call("mcp_paginated_query", {
                 }
             });
         }
+    }
+});
+
+// Add a test endpoint for SSE debugging
+app.post('/test-sse', (req, res) => {
+    logger.info('Test SSE endpoint called');
+    
+    if (!currentTransport || !currentTransport.res || currentTransport.res.finished) {
+        return res.status(503).json({ error: 'No active SSE connection' });
+    }
+    
+    try {
+        const testMessage = {
+            jsonrpc: "2.0",
+            id: req.body.id || "test-" + Date.now(),
+            result: {
+                content: [{
+                    type: "text",
+                    text: "Test SSE message sent successfully at " + new Date().toISOString()
+                }]
+            }
+        };
+        
+        currentTransport.res.write(`event: message\n`);
+        currentTransport.res.write(`data: ${JSON.stringify(testMessage)}\n\n`);
+        
+        if (typeof currentTransport.res.flush === 'function') {
+            currentTransport.res.flush();
+        }
+        
+        logger.info('Test SSE message sent');
+        res.status(200).json({ success: true, message: 'Test message sent via SSE' });
+        
+    } catch (error) {
+        logger.error(`Error sending test SSE message: ${error.message}`);
+        res.status(500).json({ error: error.message });
     }
 });
 
@@ -1088,8 +1152,15 @@ async function startServer() {
     try {
         logger.info(`Starting MS SQL MCP Server v${server.options?.version || "1.1.0"}...`);
 
-        // Initialize database connection pool
+        // Initialize database connection pool only if not using multi-database mode
+        // Multi-database pools are initialized by the loadMultiDatabaseConfig function
+        const hasMultiDatabaseConfig = fs.existsSync(path.join(__dirname, 'multi-db-config.json'));
+        if (!hasMultiDatabaseConfig) {
+            logger.info("No multi-database configuration found, initializing default database pool...");
         await initializeDbPool();
+        } else {
+            logger.info("Multi-database configuration detected, skipping default database initialization");
+        }
 
         // Select transport based on configuration
         if (TRANSPORT === 'sse') {
