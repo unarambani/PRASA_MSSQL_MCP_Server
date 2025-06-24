@@ -1,6 +1,21 @@
 {
   "databases": [
     {
+      "id": "dev",
+      "name": "Development",
+      "server": "${DEV_SERVER}",
+      "database": "${DEV_DB}",
+      "user": "${DEV_USER}",
+      "password": "${DEV_PASSWORD}",
+      "port": 1433,
+      "options": {
+        "encrypt": true,
+        "trustServerCertificate": true,
+        "connectionTimeout": 15000,
+        "requestTimeout": 15000
+      }
+    },
+    {
       "id": "kzn",
       "name": "KwaZulu-Natal",
       "server": "${KZN_SERVER}",
