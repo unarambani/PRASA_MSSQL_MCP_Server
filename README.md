@@ -153,7 +153,7 @@ Optimized connection management with:
 # Team members can easily update
 git pull origin main
 npm install
-npm start
+npm start:sse
 ```
 
 ### Configuration Management
