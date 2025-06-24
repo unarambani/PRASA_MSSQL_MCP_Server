@@ -1,24 +1,49 @@
 {
-  "name": "mssql-mcp-server",
-  "version": "1.0.0",
-  "description": "MS SQL Server MCP Protocol Implementation",
+  "name": "prasa-mssql-mcp-server",
+  "version": "1.1.0",
+  "description": "PRASA MS SQL Server MCP Protocol Implementation with Multi-Database Support",
   "main": "server.mjs",
   "type": "module",
+  "bin": {
+    "prasa-mssql-mcp": "./server.mjs"
+  },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "node server.mjs",
     "start:sse": "TRANSPORT=sse node server.mjs",
     "client": "node client.mjs",
     "client:sse": "TRANSPORT=sse node client.mjs",
-    "test:http": "node test-server.mjs"
+    "test:http": "node test-server.mjs",
+    "test:sse": "node test-sse.mjs",
+    "test:simple": "node test-simple.js",
+    "dev": "DEBUG=true node server.mjs",
+    "dev:sse": "DEBUG=true TRANSPORT=sse node server.mjs"
   },
   "keywords": [
     "mcp",
     "mssql",
-    "sql-server"
+    "sql-server",
+    "prasa",
+    "multi-database",
+    "model-context-protocol",
+    "claude",
+    "ai",
+    "database",
+    "microsoft-sql-server"
   ],
-  "author": "",
-  "license": "ISC",
+  "author": "unarambani",
+  "license": "GPL-3.0",
+  "homepage": "https://github.com/unarambani/PRASA_MSSQL_MCP_Server",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/unarambani/PRASA_MSSQL_MCP_Server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/unarambani/PRASA_MSSQL_MCP_Server/issues"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.1",
     "body-parser": "^1.20.2",
