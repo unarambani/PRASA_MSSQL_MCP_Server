@@ -38,7 +38,7 @@ npm install && npm run secure-setup
 # - multi-db-config.json (for multiple databases)
 
 # Start the server
-npm start
+npm start:sse
 ```
 
 ### For Team Leads (Repository Setup)
