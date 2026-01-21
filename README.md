@@ -47,6 +47,56 @@ npm start:sse
 3. Share the repository URL with your team
 4. Provide database credentials securely (not in the repository)
 
+## 💻 VSCode IDE Integration
+
+This MCP server can be used directly in Visual Studio Code with GitHub Copilot!
+
+### Quick VSCode Setup
+1. Open the project in VSCode
+2. Configure your `.env` file with database credentials
+3. VSCode will automatically detect the `.vscode/mcp.json` configuration
+4. Reload VSCode window (Ctrl+Shift+P → "Reload Window")
+5. Check MCP server status (Ctrl+Shift+P → "MCP: List Servers")
+
+### Learn More
+See **[VSCODE_SETUP.md](VSCODE_SETUP.md)** for detailed VSCode integration instructions.
+
+## 🐳 Running with Docker
+
+### Using Docker Compose (Recommended)
+This is the easiest way to run the server with persistence and configuration.
+
+```bash
+# Start the server
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+
+# Check health
+curl http://localhost:3333/health
+
+# Stop the server
+docker-compose down
+```
+
+### Manual Docker Run
+If you prefer running the container manually:
+
+```bash
+# Build image
+docker build -t mssql-mcp-server .
+
+# Run with environment variables
+docker run -d \
+  -p 3333:3333 \
+  --env-file .env \
+  -v $(pwd)/logs:/app/logs \
+  -v $(pwd)/query_results:/app/query_results \
+  --name mssql-mcp-server \
+  mssql-mcp-server
+```
+
 ## 🏢 Multi-Database Architecture
 
 Perfect for organizations with:
@@ -215,8 +265,9 @@ curl -X POST http://localhost:3333/execute-query \
   -d '{"query": "SELECT @@VERSION", "databaseId": "kzn", "returnResults": true}'
 ```
 
-## 📚 Documentation
+## 🔗 Links & Resources
 
+- **[VSCODE_SETUP.md](VSCODE_SETUP.md)** - Complete VSCode IDE integration guide
 - **[TEAM_SETUP.md](TEAM_SETUP.md)** - Complete team setup guide
 - **[MULTI_DATABASE_SUPPORT.md](MULTI_DATABASE_SUPPORT.md)** - Multi-database configuration details
 - **[SECURITY_GUIDELINES.md](SECURITY_GUIDELINES.md)** - Security best practices

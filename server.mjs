@@ -1,5 +1,6 @@
-// server.js - Main MCP Server Implementation
 import dotenv from 'dotenv';
+// Redirect all console.log to console.error to prevent MCP stdout corruption
+console.log = console.error;
 import express from 'express';
 import bodyParser from 'body-parser';
 import sql from 'mssql';
@@ -17,7 +18,7 @@ import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 
 // Import database utilities
-import { initializeDbPool, executeQuery, getDbConfig } from './Lib/database.mjs';
+import { initializeDbPool, executeQuery, getDbConfig, checkDatabaseHealth } from './Lib/database.mjs';
 
 // Import multi-database configuration loader
 import { loadMultiDatabaseConfig } from './load-multi-db-config.mjs';
@@ -35,18 +36,19 @@ import { registerPrompts } from './Lib/prompts.mjs';
 import { logger } from './Lib/logger.mjs';
 import { getReadableErrorMessage, createJsonRpcError } from './Lib/errors.mjs';
 
-// Load environment variables
-dotenv.config();
-
 // Get the directory name
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Load environment variables from specific path
+dotenv.config({ path: path.join(__dirname, '.env') });
 
 // Configuration
 const PORT = process.env.PORT || 3333;
 const TRANSPORT = process.env.TRANSPORT || 'stdio';
 const HOST = process.env.HOST || '0.0.0.0';
-const QUERY_RESULTS_PATH = process.env.QUERY_RESULTS_PATH || path.join(__dirname, 'query_results');
+const QUERY_RESULTS_PATH_VAL = process.env.QUERY_RESULTS_PATH || path.join(__dirname, 'query_results');
+const QUERY_RESULTS_PATH = path.isAbsolute(QUERY_RESULTS_PATH_VAL) ? QUERY_RESULTS_PATH_VAL : path.resolve(__dirname, QUERY_RESULTS_PATH_VAL);
 const PING_INTERVAL = process.env.PING_INTERVAL || 60000; // Ping every 60 seconds by default
 
 // Create results directory if it doesn't exist
@@ -142,7 +144,8 @@ try {
     logger.info("Checking for multi-database configuration...");
     await loadMultiDatabaseConfig();
 } catch (error) {
-    logger.info("No multi-database configuration found or failed to load. Using default configuration.");
+    logger.warn(`Multi-database configuration loading failed: ${error.message}`);
+    logger.info("Continuing with default/single database configuration");
 }
 
 // IMPORTANT: Register database tools BEFORE setting up HTTP routes
@@ -152,8 +155,9 @@ try {
     registerDatabaseTools(server);
 
     // Debug log of registered tools
-    console.log("DEBUG: Tools after registration:");
-    console.log(Object.keys(server._tools || {}));
+    // Debug log of registered tools
+    logger.info("DEBUG: Tools after registration:");
+    logger.info(Object.keys(server._tools || {}));
 
     // Register database resources (tables, schema, views, etc.)
     logger.info("Registering database resources...");
@@ -414,6 +418,34 @@ app.get('/sse', async (req, res) => {
         // Connect the server to this transport
         await server.connect(currentTransport);
 
+        // Monkey-patch send method ONCE at connection time (not on every message)
+        // This ensures proper SSE message formatting for JSON-RPC responses
+        if (currentTransport && typeof currentTransport.send === 'function' && !currentTransport._sendPatched) {
+            const originalSend = currentTransport.send.bind(currentTransport);
+            currentTransport._originalSend = originalSend; // Store for reference
+            currentTransport._sendPatched = true; // Mark as patched to prevent re-patching
+
+            currentTransport.send = function (message) {
+                // For JSON-RPC responses, write directly to stream with proper format
+                if (message.jsonrpc === "2.0" && message.id && (message.result || message.error)) {
+                    if (this.res && !this.res.finished) {
+                        this.res.write(`event: message\n`);
+                        this.res.write(`data: ${JSON.stringify(message)}\n\n`);
+
+                        if (typeof this.res.flush === 'function') {
+                            this.res.flush();
+                        }
+                        logger.debug(`Sent SSE message event for request ID: ${message.id}`);
+                        return;
+                    }
+                }
+
+                // Fall back to original behavior for other messages
+                return originalSend(message);
+            };
+            logger.info('SSE transport send method patched for proper message formatting');
+        }
+
         logger.info('SSE transport connected successfully');
 
         // Add this connection to tracking
@@ -667,8 +699,21 @@ const prevPage = await tool.call("mcp_paginated_query", {
 
         // Special handling for tool calls - properly send via SSE transport
         if (method === 'tools/call') {
-            const toolName = req.body.params?.name;
-            const toolArgs = req.body.params?.arguments || {};
+            const toolName = typeof req.body.params === 'string' ? req.body.params : req.body.params?.name;
+            const toolArgs = typeof req.body.params === 'string' ? {} : (req.body.params?.arguments || {});
+
+            if (!toolName) {
+                logger.error(`Tool name missing in request: ${JSON.stringify(req.body)}`);
+                res.status(400).json({
+                    jsonrpc: "2.0",
+                    id: requestId,
+                    error: {
+                        code: -32602,
+                        message: "Invalid params: tool name is required"
+                    }
+                });
+                return;
+            }
 
             logger.info(`Direct handling for tool call: ${toolName}`);
 
@@ -710,7 +755,7 @@ const prevPage = await tool.call("mcp_paginated_query", {
                             // Write directly to the SSE connection with event: message format
                             currentTransport.res.write(`event: message\n`);
                             currentTransport.res.write(`data: ${JSON.stringify(sseResponse)}\n\n`);
-                            
+
                             // Ensure the data is flushed immediately
                             if (typeof currentTransport.res.flush === 'function') {
                                 currentTransport.res.flush();
@@ -744,7 +789,7 @@ const prevPage = await tool.call("mcp_paginated_query", {
 
                             currentTransport.res.write(`event: message\n`);
                             currentTransport.res.write(`data: ${JSON.stringify(errorResponse)}\n\n`);
-                            
+
                             // Ensure the data is flushed immediately
                             if (typeof currentTransport.res.flush === 'function') {
                                 currentTransport.res.flush();
@@ -798,35 +843,9 @@ const prevPage = await tool.call("mcp_paginated_query", {
             }
         }
 
-        // Special case for SSEServerTransport - monkey patch its send method to ensure correct format
-        // This affects all other tool calls that go through the standard transport
-        if (currentTransport && typeof currentTransport.send === 'function') {
-            const originalSend = currentTransport.send;
-            currentTransport.send = function (message) {
-                logger.info(`Intercepting SSE transport send: ${JSON.stringify(message)}`);
 
-                // Don't use the original send for JSON-RPC responses, write directly to the stream
-                if (message.jsonrpc === "2.0" && message.id && (message.result || message.error)) {
-                    if (this.res && !this.res.finished) {
-                        // Write the message with event: message format as per GitHub reference
-                        this.res.write(`event: message\n`);
-                        this.res.write(`data: ${JSON.stringify(message)}\n\n`);
-                        
-                        // Ensure the data is flushed immediately
-                        if (typeof this.res.flush === 'function') {
-                            this.res.flush();
-                        }
-
-                        // No need for separate completion event with this format
-                        logger.info(`Sent message event for request ID: ${message.id}`);
-                        return;
-                    }
-                }
-
-                // Fall back to original behavior for other messages
-                return originalSend.call(this, message);
-            };
-        }
+        // Note: SSE transport send method is already patched at connection time (/sse endpoint)
+        // No need to re-patch on every message
 
         // For standard message handling (non-tool calls or tools we couldn't handle directly)
         // Let the SSEServerTransport handle it with our monkey-patched send method
@@ -867,11 +886,11 @@ const prevPage = await tool.call("mcp_paginated_query", {
 // Add a test endpoint for SSE debugging
 app.post('/test-sse', (req, res) => {
     logger.info('Test SSE endpoint called');
-    
+
     if (!currentTransport || !currentTransport.res || currentTransport.res.finished) {
         return res.status(503).json({ error: 'No active SSE connection' });
     }
-    
+
     try {
         const testMessage = {
             jsonrpc: "2.0",
@@ -883,20 +902,48 @@ app.post('/test-sse', (req, res) => {
                 }]
             }
         };
-        
+
         currentTransport.res.write(`event: message\n`);
         currentTransport.res.write(`data: ${JSON.stringify(testMessage)}\n\n`);
-        
+
         if (typeof currentTransport.res.flush === 'function') {
             currentTransport.res.flush();
         }
-        
+
         logger.info('Test SSE message sent');
         res.status(200).json({ success: true, message: 'Test message sent via SSE' });
-        
+
     } catch (error) {
         logger.error(`Error sending test SSE message: ${error.message}`);
         res.status(500).json({ error: error.message });
+    }
+});
+
+// Health check endpoint
+app.get('/health', async (req, res) => {
+    try {
+        const dbHealth = await checkDatabaseHealth();
+
+        // Determine overall status
+        const allHealthy = dbHealth.every(db => db.status === 'healthy');
+        const anyConnected = dbHealth.some(db => db.connected);
+
+        const status = allHealthy ? 'healthy' : (anyConnected ? 'degraded' : 'unhealthy');
+        const statusCode = status === 'preflight' ? 503 : 200;
+
+        res.status(statusCode).json({
+            status,
+            version: '1.1.0',
+            uptime: process.uptime(),
+            timestamp: new Date().toISOString(),
+            databases: dbHealth
+        });
+    } catch (error) {
+        logger.error(`Health check failed: ${error.message}`);
+        res.status(500).json({
+            status: 'error',
+            error: error.message
+        });
     }
 });
 
@@ -1157,7 +1204,7 @@ async function startServer() {
         const hasMultiDatabaseConfig = fs.existsSync(path.join(__dirname, 'multi-db-config.json'));
         if (!hasMultiDatabaseConfig) {
             logger.info("No multi-database configuration found, initializing default database pool...");
-        await initializeDbPool();
+            await initializeDbPool();
         } else {
             logger.info("Multi-database configuration detected, skipping default database initialization");
         }

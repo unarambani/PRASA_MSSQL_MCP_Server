@@ -1,0 +1,58 @@
+version: '3.8'
+
+services:
+  mssql-mcp-server:
+    build: .
+    image: mssql-mcp-server:latest
+    container_name: mssql-mcp-server
+    restart: unless-stopped
+    ports:
+      - "3333:3333"
+    environment:
+      - NODE_ENV=production
+      - TRANSPORT=sse
+      - PORT=3333
+      - LOG_LEVEL=info
+      # Pass through DB credentials from host .env
+      - DB_SERVER
+      - DB_USER
+      - DB_PASSWORD
+      - DB_DATABASE
+      - DB_PORT
+      - DB_ENCRYPT
+      - DB_TRUST_SERVER_CERT
+      # Pass through multi-db environment variables
+      - KZN_SERVER
+      - KZN_DB
+      - KZN_USER
+      - KZN_PASSWORD
+      - GP_SERVER
+      - GP_DB
+      - GP_USER
+      - GP_PASSWORD
+      - EL_SERVER
+      - EL_DB
+      - EL_USER
+      - EL_PASSWORD
+      - PE_SERVER
+      - PE_DB
+      - PE_USER
+      - PE_PASSWORD
+      - CPT_SERVER
+      - CPT_DB
+      - CPT_USER
+      - CPT_PASSWORD
+    volumes:
+      # Mount configuration and persistence directories
+      - ./multi-db-config.json:/app/multi-db-config.json:ro
+      - ./logs:/app/logs
+      - ./query_results:/app/query_results
+    # Load environment variables from .env file
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3333/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

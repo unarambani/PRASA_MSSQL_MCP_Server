@@ -6,15 +6,16 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import crypto from 'crypto';
 
-dotenv.config();
-
 // Get the directory name
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+dotenv.config({ path: path.join(__dirname, '../.env') });
+
 // Configuration
 const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
-const LOG_FILE = process.env.LOG_FILE || path.join(__dirname, '../logs/mcp-server.log');
+const LOG_FILE_PATH = process.env.LOG_FILE || path.join(__dirname, '../logs/mcp-server.log');
+const LOG_FILE = path.isAbsolute(LOG_FILE_PATH) ? LOG_FILE_PATH : path.resolve(path.join(__dirname, '..'), LOG_FILE_PATH);
 const LOG_MAX_SIZE = process.env.LOG_MAX_SIZE || '10m';
 const LOG_MAX_FILES = parseInt(process.env.LOG_MAX_FILES) || 5;
 const LOG_FORMAT = process.env.LOG_FORMAT || 'json';
@@ -56,9 +57,11 @@ export const logger = winston.createLogger({
     defaultMeta: { service: 'mcp-server' },
     format: logFormats[LOG_FORMAT] || logFormats.json,
     transports: [
-        // Console transport
-        new winston.transports.Console(),
-        
+        // Stream transport to stderr to avoid stdout corruption
+        new winston.transports.Stream({
+            stream: process.stderr
+        }),
+
         // File transport with rotation
         new winston.transports.File({
             filename: LOG_FILE,
@@ -81,10 +84,10 @@ export const logStream = {
 export const addRequestContext = (req, res, next) => {
     // Add a unique request ID if not present
     req.id = req.headers['x-request-id'] || crypto.randomUUID();
-    
+
     // Add correlation ID for tracing
     const correlationId = req.headers['x-correlation-id'] || req.id;
-    
+
     // Add request context to logger
     logger.defaultMeta = {
         ...logger.defaultMeta,
@@ -93,11 +96,11 @@ export const addRequestContext = (req, res, next) => {
         method: req.method,
         url: req.url
     };
-    
+
     // Add response headers for tracing
     res.setHeader('X-Request-ID', req.id);
     res.setHeader('X-Correlation-ID', correlationId);
-    
+
     next();
 };
 
@@ -107,16 +110,24 @@ process.on('uncaughtException', (error) => {
         stack: error.stack,
         name: error.name
     });
-    
-    // Exit with error
-    process.exit(1);
+
+    // Only exit for truly fatal errors that prevent server operation
+    const fatalErrors = ['EADDRINUSE', 'ERR_SOCKET_BAD_TYPE', 'ERR_SOCKET_ALREADY_BOUND'];
+    if (fatalErrors.includes(error.code)) {
+        logger.error('Fatal error - server cannot continue, exiting...');
+        process.exit(1);
+    }
+    // For other errors, log but allow server to continue
+    logger.warn('Server continuing after uncaught exception - some functionality may be affected');
 });
 
 process.on('unhandledRejection', (reason, promise) => {
     logger.error('Unhandled Rejection at:', {
-        promise: promise,
-        reason: reason
+        promise: String(promise),
+        reason: reason instanceof Error ? reason.message : String(reason),
+        stack: reason instanceof Error ? reason.stack : undefined
     });
+    // Don't crash on unhandled rejection - log and continue
 });
 
 // Export logger

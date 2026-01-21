@@ -1,40 +1,37 @@
-FROM node:20-alpine AS base
+# Use Node.js 20 slim image for production
+FROM node:20-slim
 
-WORKDIR /usr/src/app
+# Set working directory
+WORKDIR /app
 
-# Install dependencies only when needed
-FROM base AS deps
-# Check https://github.com/nodejs/docker-node/tree/b4117f9333da4138b03a546ec926ef50a31506c3#nodealpine to understand why libc6-compat might be needed.
-RUN apk add --no-cache libc6-compat
-WORKDIR /usr/src/app
-COPY package.json package-lock.json* ./ 
+# Install dependencies needed for some native modules if any (optional but safer)
+# RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
+
+# Copy package files first for better caching
+COPY package.json package-lock.json ./
+
+# Install dependencies needed for production and healthcheck
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+
+# Install only production dependencies
 RUN npm ci --only=production
 
-# Rebuild the source code only when needed
-FROM base AS builder 
-WORKDIR /usr/src/app
-COPY --from=deps /usr/src/app/node_modules ./node_modules
-COPY . . 
+# Copy source code
+COPY . .
 
-# Production image, copy all the files and run next
-FROM base AS runner
-WORKDIR /usr/src/app
+# Create necessary directories for persistence
+RUN mkdir -p logs query_results
 
+# Set default environment variables
 ENV NODE_ENV=production
-# Uncomment the following line in case you want to disable telemetry during runtime.
-# ENV NEXT_TELEMETRY_DISABLED 1
-
-# Set the correct user
-RUN addgroup --system --gid 1001 nodejs
-RUN adduser --system --uid 1001 nextjs
-
-COPY --from=builder /usr/src/app . 
-
-USER nextjs
-
-EXPOSE 3333
-
-# Set the correct environment variables
+ENV TRANSPORT=sse
 ENV PORT=3333
 
-CMD ["node", "server.mjs"] 
+# Expose the server port
+EXPOSE 3333
+
+# switch to non-root user for security
+USER node
+
+# Start the server
+CMD ["npm", "run", "start:sse"]

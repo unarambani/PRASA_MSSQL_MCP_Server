@@ -35,16 +35,16 @@ let pool = null;
 export async function getSqlServerClient() {
     if (!pool) {
         try {
-            console.log('🔌 Creating new SQL Server connection pool');
+            console.error('🔌 Creating new SQL Server connection pool');
             pool = await sql.connect(config);
-            
+
             // Set up event handlers for the pool
             pool.on('error', err => {
                 console.error('❌ SQL Pool Error:', err);
                 pool = null; // Reset the pool on error
             });
-            
-            console.log('✅ Connected to SQL Server database');
+
+            console.error('✅ Connected to SQL Server database');
         } catch (err) {
             console.error('❌ Failed to connect to SQL Server:', err.message);
             // For connection errors, log additional details that might help debugging
@@ -57,7 +57,7 @@ export async function getSqlServerClient() {
             throw err;
         }
     }
-    
+
     return pool;
 }
 
@@ -69,14 +69,14 @@ export async function getSqlServerClient() {
  */
 export async function executeQuery(query, params = {}) {
     const client = await getSqlServerClient();
-    
+
     try {
-        console.log('🔍 Executing SQL query');
+        console.error('🔍 Executing SQL query');
         const result = await client.request()
             .input('params', sql.NVarChar, JSON.stringify(params))
             .query(query);
-        
-        console.log(`✅ Query executed successfully, returned ${result.recordset?.length || 0} rows`);
+
+        console.error(`✅ Query executed successfully, returned ${result.recordset?.length || 0} rows`);
         return result.recordset || [];
     } catch (err) {
         console.error('❌ Query execution error:', err.message);
@@ -91,7 +91,7 @@ export async function closeConnection() {
     if (pool) {
         try {
             await pool.close();
-            console.log('🔌 SQL Server connection pool closed');
+            console.error('🔌 SQL Server connection pool closed');
             pool = null;
         } catch (err) {
             console.error('❌ Error closing SQL Server connection:', err.message);
@@ -119,7 +119,7 @@ export function createSqlClient(dbConfig) {
         ...dbConfig,
         port: dbConfig.port || parseInt(process.env.DB_PORT) || 1433
     };
-    
+
     return {
         /**
          * Execute a query against MS SQL Server
@@ -130,7 +130,7 @@ export function createSqlClient(dbConfig) {
             try {
                 const pool = await sql.connect(finalConfig);
                 try {
-                    console.log(`Executing SQL: ${sqlQuery.substring(0, 100)}${sqlQuery.length > 100 ? '...' : ''}`);
+                    console.error(`Executing SQL: ${sqlQuery.substring(0, 100)}${sqlQuery.length > 100 ? '...' : ''}`);
                     const result = await pool.request().query(sqlQuery);
                     return result;
                 } finally {
@@ -141,7 +141,7 @@ export function createSqlClient(dbConfig) {
                 throw err;
             }
         },
-        
+
         /**
          * Get a list of all tables in the database
          * @returns {Promise<Array>} List of table names
@@ -168,7 +168,7 @@ export function createSqlClient(dbConfig) {
                 throw err;
             }
         },
-        
+
         /**
          * Get schema information for the database
          * @returns {Promise<Array>} Schema information

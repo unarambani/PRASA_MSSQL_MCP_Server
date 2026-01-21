@@ -1,44 +1,31 @@
-import fetch from 'node-fetch';
+import sql from 'mssql';
 
-const SERVER_URL = 'http://localhost:3333';
-const MESSAGES_ENDPOINT = `${SERVER_URL}/messages`;
+const config = {
+  user: 'tads',
+  password: 'biddcom@123',
+  server: '10.30.7.70',
+  database: 'EastLondon_TSDB',
+  options: {
+    encrypt: false,
+    trustServerCertificate: true,
+    connectionTimeout: 15000,
+    requestTimeout: 15000
+  }
+};
 
-async function main() {
-  console.log('Sending SQL query directly to the messages endpoint...');
-  
+async function checkConnection() {
+  console.log('🔗 Connecting to EL directly with mssql driver...');
   try {
-    const response = await fetch(MESSAGES_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: '123',
-        method: 'tools/call',
-        params: {
-          name: 'SQL_execute_query',
-          parameters: {
-            sql: 'SELECT TOP 5 name FROM sys.tables'
-          }
-        }
-      })
-    });
-    
-    const responseStatus = response.status;
-    const responseText = await response.text();
-    
-    console.log(`Response status: ${responseStatus}`);
-    console.log(`Response text: ${responseText}`);
-    
-    if (responseStatus === 202) {
-      console.log('Request accepted. Response should be delivered over SSE connection.');
-    } else {
-      console.log('Unexpected response. Check server configuration.');
-    }
+    const pool = await sql.connect(config);
+    console.log('✅ Connected successfully!');
+
+    const result = await pool.request().query('SELECT 1 as result');
+    console.log('📄 Query result:', result.recordset);
+
+    await pool.close();
   } catch (err) {
-    console.error('Error:', err.message);
+    console.error('❌ Connection failed:', err);
   }
 }
 
-main().catch(console.error); 
+checkConnection();

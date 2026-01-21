@@ -1,9 +1,15 @@
 // lib/database.js - Database utilities with multi-database support
 import sql from 'mssql';
 import dotenv from 'dotenv';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { logger } from './logger.mjs';
 
-dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config({ path: path.join(__dirname, '../.env') });
 
 // Database configurations - support multiple databases
 const databaseConfigs = {};
@@ -18,7 +24,7 @@ const defaultDbConfig = {
     database: process.env.DB_DATABASE || 'master',
     port: parseInt(process.env.DB_PORT) || 1433,
     options: {
-        encrypt: process.env.DB_ENCRYPT === 'true', 
+        encrypt: process.env.DB_ENCRYPT === 'true',
         trustServerCertificate: true, // Always trust server certificate for self-signed certs
         connectionTimeout: parseInt(process.env.DB_CONNECTION_TIMEOUT) || 15000,
         requestTimeout: parseInt(process.env.DB_REQUEST_TIMEOUT) || 15000,
@@ -44,7 +50,7 @@ export function registerDatabase(databaseId, config) {
         if (!databaseId || !config) {
             throw new Error('Database ID and configuration are required');
         }
-        
+
         // Validate required config fields
         const requiredFields = ['user', 'password', 'server', 'database'];
         for (const field of requiredFields) {
@@ -52,7 +58,7 @@ export function registerDatabase(databaseId, config) {
                 throw new Error(`Missing required field: ${field}`);
             }
         }
-        
+
         // Set default values for optional fields
         const fullConfig = {
             ...config,
@@ -69,7 +75,7 @@ export function registerDatabase(databaseId, config) {
                 }
             }
         };
-        
+
         databaseConfigs[databaseId] = fullConfig;
         logger.info(`Registered database: ${databaseId} (${config.server}/${config.database})`);
         return true;
@@ -103,7 +109,7 @@ export function switchDatabase(databaseId) {
         logger.error(`Database ${databaseId} not found`);
         return false;
     }
-    
+
     currentDatabaseId = databaseId;
     logger.info(`Switched to database: ${databaseId}`);
     return true;
@@ -124,26 +130,31 @@ export function getCurrentDatabaseId() {
  */
 export async function initializeDbPool(databaseId = null) {
     const dbId = databaseId || currentDatabaseId;
-    
+
     if (!databaseConfigs[dbId]) {
         throw new Error(`Database configuration not found: ${dbId}`);
     }
-    
+
     try {
-        logger.info(`Initializing SQL Server connection pool for: ${dbId}...`);
-        
         const config = databaseConfigs[dbId];
-        
+        // DEBUG: Log config details
+        logger.info(`DEBUG: Pool Config for ${dbId}: user=${config.user}, server=${config.server}, port=${config.port}, database=${config.database}`);
+        logger.info(`DEBUG: Options: ${JSON.stringify(config.options)}`);
+
+        logger.info(`Initializing SQL Server connection pool for: ${dbId}...`);
+
+
+
         // Create and connect the pool
         const pool = await new sql.ConnectionPool(config).connect();
-        
+
         // Setup pool error handler
         pool.on('error', err => {
             logger.error(`SQL Pool Error (${dbId}): ${err.message}`);
         });
-        
+
         sqlPools[dbId] = pool;
-        
+
         logger.info(`SQL Server connection pool initialized successfully for ${dbId} (${config.server}/${config.database})`);
         return true;
     } catch (err) {
@@ -159,7 +170,7 @@ export async function initializeDbPool(databaseId = null) {
  */
 async function ensurePoolConnected(databaseId = null) {
     const dbId = databaseId || currentDatabaseId;
-    
+
     if (!sqlPools[dbId]) {
         await initializeDbPool(dbId);
     } else if (!sqlPools[dbId].connected) {
@@ -185,53 +196,53 @@ async function ensurePoolConnected(databaseId = null) {
  */
 export async function executeQuery(sqlQuery, parameters = {}, retryCount = 3, databaseId = null) {
     const dbId = databaseId || currentDatabaseId;
-    
+
     if (sqlQuery.length > 100) {
         logger.info(`Executing SQL on ${dbId}: ${sqlQuery.substring(0, 100)}...`);
     } else {
         logger.info(`Executing SQL on ${dbId}: ${sqlQuery}`);
     }
-    
+
     await ensurePoolConnected(dbId);
-    
+
     try {
         const request = sqlPools[dbId].request();
-        
+
         // Add parameters if provided
         for (const [key, value] of Object.entries(parameters)) {
             request.input(key, value);
         }
-        
+
         const startTime = Date.now();
         const result = await request.query(sqlQuery);
         const executionTime = Date.now() - startTime;
-        
+
         logger.info(`SQL executed successfully on ${dbId} in ${executionTime}ms, returned ${result.recordset?.length || 0} rows`);
-        
+
         // Add execution time and database info to result
         result.executionTime = executionTime;
         result.databaseId = dbId;
-        
+
         return result;
     } catch (err) {
         logger.error(`SQL execution failed on ${dbId}: ${err.message}`);
-        
+
         // Handle transient errors with retry logic
         const transientErrors = ['ETIMEOUT', 'ECONNCLOSED', 'ECONNRESET', 'ESOCKET'];
         if (transientErrors.includes(err.code) && retryCount > 0) {
             logger.info(`Retrying SQL execution on ${dbId} (${retryCount} attempts left)...`);
-            
+
             // Wait before retrying
             await new Promise(resolve => setTimeout(resolve, 1000));
-            
+
             // Force pool reconnection for connection-related errors
             if (['ECONNCLOSED', 'ECONNRESET'].includes(err.code)) {
                 delete sqlPools[dbId];
             }
-            
+
             return executeQuery(sqlQuery, parameters, retryCount - 1, databaseId);
         }
-        
+
         throw err;
     }
 }
@@ -244,47 +255,47 @@ export async function executeQuery(sqlQuery, parameters = {}, retryCount = 3, da
  */
 export async function executeTransaction(queries, databaseId = null) {
     const dbId = databaseId || currentDatabaseId;
-    
+
     if (!Array.isArray(queries) || queries.length === 0) {
         throw new Error('No queries provided for transaction');
     }
-    
+
     logger.info(`Starting transaction on ${dbId} with ${queries.length} queries`);
-    
+
     await ensurePoolConnected(dbId);
-    
+
     const transaction = new sql.Transaction(sqlPools[dbId]);
-    
+
     try {
         await transaction.begin();
         logger.info(`Transaction started on ${dbId}`);
-        
+
         const results = [];
-        
+
         for (let i = 0; i < queries.length; i++) {
             const { sql: sqlQuery, parameters = {} } = queries[i];
-            
+
             logger.info(`Executing transaction query ${i + 1}/${queries.length} on ${dbId}`);
-            
+
             const request = new sql.Request(transaction);
-            
+
             // Add parameters if provided
             for (const [key, value] of Object.entries(parameters)) {
                 request.input(key, value);
             }
-            
+
             const result = await request.query(sqlQuery);
             result.databaseId = dbId;
             results.push(result);
         }
-        
+
         await transaction.commit();
         logger.info(`Transaction committed successfully on ${dbId}`);
-        
+
         return results;
     } catch (err) {
         logger.error(`Transaction failed on ${dbId}: ${err.message}`);
-        
+
         // Try to roll back the transaction
         try {
             await transaction.rollback();
@@ -292,7 +303,7 @@ export async function executeTransaction(queries, databaseId = null) {
         } catch (rollbackErr) {
             logger.error(`Failed to roll back transaction on ${dbId}: ${rollbackErr.message}`);
         }
-        
+
         throw err;
     }
 }
@@ -308,16 +319,16 @@ export async function executeQueryOnMultipleDatabases(sqlQuery, databaseIds, par
     if (!Array.isArray(databaseIds) || databaseIds.length === 0) {
         throw new Error('No database IDs provided');
     }
-    
+
     // Validate all database IDs exist
     for (const dbId of databaseIds) {
         if (!databaseConfigs[dbId]) {
             throw new Error(`Database configuration not found: ${dbId}`);
         }
     }
-    
+
     logger.info(`Executing query on ${databaseIds.length} databases: ${databaseIds.join(', ')}`);
-    
+
     // Execute queries in parallel
     const promises = databaseIds.map(async (dbId) => {
         try {
@@ -340,9 +351,9 @@ export async function executeQueryOnMultipleDatabases(sqlQuery, databaseIds, par
             };
         }
     });
-    
+
     const results = await Promise.allSettled(promises);
-    
+
     return results.map(result => result.status === 'fulfilled' ? result.value : {
         databaseId: 'unknown',
         success: false,
@@ -362,10 +373,10 @@ export async function tableExists(tableName, databaseId = null) {
             SELECT COUNT(*) AS TableCount
             FROM INFORMATION_SCHEMA.TABLES
             WHERE TABLE_NAME = @tableName
-        `, { 
-            tableName 
+        `, {
+            tableName
         }, 3, databaseId);
-        
+
         return result.recordset[0].TableCount > 0;
     } catch (err) {
         logger.error(`Error checking if table exists: ${err.message}`);
@@ -380,10 +391,10 @@ export async function tableExists(tableName, databaseId = null) {
  */
 export function sanitizeSqlIdentifier(identifier) {
     if (!identifier) return '';
-    
+
     // Remove brackets if present
     identifier = identifier.replace(/^\[|\]$/g, '');
-    
+
     // Remove SQL injection characters and non-alphanumeric characters
     return identifier.replace(/[^a-zA-Z0-9_]/g, '');
 }
@@ -397,11 +408,11 @@ export function sanitizeSqlIdentifier(identifier) {
 export function getDbConfig(maskPassword = false, databaseId = null) {
     const dbId = databaseId || currentDatabaseId;
     const config = { ...databaseConfigs[dbId] };
-    
+
     if (maskPassword) {
         config.password = '********';
     }
-    
+
     return config;
 }
 
@@ -412,32 +423,74 @@ export function getDbConfig(maskPassword = false, databaseId = null) {
  */
 export function formatSqlError(error) {
     if (!error) return 'Unknown error';
-    
+
     // Special handling for SQL Server errors
     if (error.number) {
         return `SQL Error ${error.number}: ${error.message}`;
     }
-    
+
     return error.message || 'Unknown SQL error';
+}
+
+/**
+ * Check health of all database connections
+ * @returns {Promise<Array>} - Array of health check results
+ */
+export async function checkDatabaseHealth() {
+    const results = [];
+
+    for (const [dbId, pool] of Object.entries(sqlPools)) {
+        try {
+            if (pool && pool.connected) {
+                // Execute simple health check query
+                const startTime = Date.now();
+                await pool.request().query('SELECT 1 AS health_check');
+                const latency = Date.now() - startTime;
+
+                results.push({
+                    databaseId: dbId,
+                    status: 'healthy',
+                    latencyMs: latency,
+                    connected: true
+                });
+            } else {
+                results.push({
+                    databaseId: dbId,
+                    status: 'disconnected',
+                    connected: false
+                });
+            }
+        } catch (err) {
+            results.push({
+                databaseId: dbId,
+                status: 'error',
+                error: err.message,
+                connected: false
+            });
+        }
+    }
+
+    return results;
 }
 
 // Only initialize default database pool if we're in single-database mode
 // In multi-database mode, the multi-db-config loader handles initialization
 // Check if multi-db-config.json exists to determine mode
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 const multiDbConfigPath = path.join(__dirname, '..', 'multi-db-config.json');
 const hasMultiDatabaseConfig = fs.existsSync(multiDbConfigPath);
 
 if (!hasMultiDatabaseConfig && process.env.DB_SERVER) {
     logger.info("Single database mode detected, initializing default database pool...");
-initializeDbPool('default').catch(err => {
-    logger.error(`Failed to initialize default database pool: ${err.message}`);
-});
+    initializeDbPool('default')
+        .then(() => {
+            logger.info("Default database pool initialized successfully");
+        })
+        .catch(err => {
+            logger.error(`Failed to initialize default database pool: ${err.message}`);
+            logger.warn("Server will continue without database connection - tools may fail until connection is established");
+        });
 } else if (hasMultiDatabaseConfig) {
     logger.info("Multi-database configuration detected, skipping automatic default database initialization");
+} else {
+    logger.warn("No DB_SERVER configured and no multi-db-config.json found - database features will not be available until configured");
 }

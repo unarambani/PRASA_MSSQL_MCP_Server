@@ -12,10 +12,10 @@ import { logger } from './logger.mjs';
  * @returns {Object} - Object with transformed SQL and updated parameters
  */
 export function paginateQuery(sql, options) {
-    const { 
-        cursorField = null, 
-        pageSize = 100, 
-        cursor = null, 
+    const {
+        cursorField = null,
+        pageSize = 100,
+        cursor = null,
         parameters = {},
         defaultCursorField = 'id'
     } = options;
@@ -23,20 +23,20 @@ export function paginateQuery(sql, options) {
     // Make a copy of the parameters to avoid mutation
     const updatedParameters = { ...parameters };
     let paginatedSql = sql.trim();
-    
+
     // Check if SQL already has ORDER BY
     const hasOrderBy = /\border\s+by\b/i.test(paginatedSql);
-    
+
     // Extract the ORDER BY clause if it exists
     let orderByClause = '';
     let actualCursorField = cursorField;
-    
+
     if (hasOrderBy) {
         // Extract the ORDER BY clause to determine the cursor field if not provided
         const orderByMatch = paginatedSql.match(/ORDER\s+BY\s+([^)]+?)(?:\s+OFFSET|\s+FOR\s+JSON|\s+FOR\s+XML|\s*$)/i);
         if (orderByMatch) {
             orderByClause = orderByMatch[1].trim();
-            
+
             // If no cursor field provided, use the first field in ORDER BY
             if (!actualCursorField) {
                 const firstOrderField = orderByClause.split(',')[0].trim();
@@ -53,48 +53,66 @@ export function paginateQuery(sql, options) {
         actualCursorField = defaultCursorField;
         orderByClause = `${actualCursorField} ASC`;
         paginatedSql = `${paginatedSql} ORDER BY ${orderByClause}`;
-        
+
         logger.warn(`No ORDER BY or cursor field provided, using default: ${defaultCursorField}`);
     }
-    
-    // Process cursor if provided
+
+    // Process cursor if provided - must be inserted BEFORE ORDER BY
     if (cursor) {
         try {
             // Decode the cursor
             const decodedCursor = JSON.parse(Buffer.from(cursor, 'base64').toString('utf8'));
             const { field, value, operator } = decodedCursor;
-            
+
             // Validate cursor
             if (!field || value === undefined) {
                 throw new Error('Invalid cursor format');
             }
-            
+
             const fieldToUse = field || actualCursorField;
             const comparator = operator || '>';
-            
-            // Add WHERE clause to implement the cursor
-            const whereClause = paginatedSql.toLowerCase().includes('where') ? 'AND' : 'WHERE';
             const cursorParamName = `cursor_${fieldToUse.replace(/[^a-zA-Z0-9_]/g, '_')}`;
-            
-            paginatedSql = `${paginatedSql} ${whereClause} [${fieldToUse}] ${comparator} @${cursorParamName}`;
-            
+
+            // Find the ORDER BY position to insert the cursor condition before it
+            const orderByMatch = paginatedSql.match(/\bORDER\s+BY\b/i);
+
+            if (orderByMatch) {
+                const orderByIndex = paginatedSql.toLowerCase().indexOf(orderByMatch[0].toLowerCase());
+                const beforeOrderBy = paginatedSql.substring(0, orderByIndex).trim();
+                const orderByAndAfter = paginatedSql.substring(orderByIndex);
+
+                // Determine if we need WHERE or AND
+                const whereClause = beforeOrderBy.toLowerCase().includes('where') ? 'AND' : 'WHERE';
+
+                // Insert the cursor condition before ORDER BY
+                paginatedSql = `${beforeOrderBy} ${whereClause} [${fieldToUse}] ${comparator} @${cursorParamName} ${orderByAndAfter}`;
+            } else {
+                // No ORDER BY found, just append the WHERE clause
+                const whereClause = paginatedSql.toLowerCase().includes('where') ? 'AND' : 'WHERE';
+                paginatedSql = `${paginatedSql} ${whereClause} [${fieldToUse}] ${comparator} @${cursorParamName}`;
+            }
+
             // Add cursor value as a parameter
             updatedParameters[cursorParamName] = value;
-            
+
             logger.info(`Applied cursor: ${field} ${comparator} ${value}`);
         } catch (err) {
             logger.error(`Error processing cursor: ${err.message}`);
             // Continue without cursor if invalid
         }
     }
-    
+
     // Add OFFSET/FETCH for SQL Server pagination syntax if not already present
+    // Note: OFFSET/FETCH requires ORDER BY and must come after it
     if (!paginatedSql.toLowerCase().includes('offset') && !paginatedSql.toLowerCase().includes('fetch')) {
-        paginatedSql = `${paginatedSql} OFFSET 0 ROWS FETCH NEXT ${pageSize} ROWS ONLY`;
+        // Check if query uses TOP clause - if so, we can't add OFFSET/FETCH
+        if (!/\bTOP\s+\d+/i.test(paginatedSql)) {
+            paginatedSql = `${paginatedSql} OFFSET 0 ROWS FETCH NEXT ${pageSize} ROWS ONLY`;
+        }
     }
-    
-    return { 
-        paginatedSql, 
+
+    return {
+        paginatedSql,
         parameters: updatedParameters,
         cursorField: actualCursorField
     };
@@ -108,21 +126,21 @@ export function paginateQuery(sql, options) {
  */
 export function generateNextCursor(lastRow, cursorField) {
     if (!lastRow || !cursorField) return null;
-    
+
     // Get the value from the last row
     const value = lastRow[cursorField];
     if (value === undefined) {
         logger.warn(`Cursor field "${cursorField}" not found in result row`);
         return null;
     }
-    
+
     // Create cursor object
-    const cursor = { 
-        field: cursorField, 
-        value: value, 
-        operator: '>' 
+    const cursor = {
+        field: cursorField,
+        value: value,
+        operator: '>'
     };
-    
+
     // Encode as base64 for URL-friendliness
     return Buffer.from(JSON.stringify(cursor)).toString('base64');
 }
@@ -135,21 +153,21 @@ export function generateNextCursor(lastRow, cursorField) {
  */
 export function generatePrevCursor(firstRow, cursorField) {
     if (!firstRow || !cursorField) return null;
-    
+
     // Get the value from the first row
     const value = firstRow[cursorField];
     if (value === undefined) {
         logger.warn(`Cursor field "${cursorField}" not found in result row`);
         return null;
     }
-    
+
     // Create cursor object
-    const cursor = { 
-        field: cursorField, 
-        value: value, 
+    const cursor = {
+        field: cursorField,
+        value: value,
         operator: '<=' // Use <= for backward pagination
     };
-    
+
     // Encode as base64 for URL-friendliness
     return Buffer.from(JSON.stringify(cursor)).toString('base64');
 }
@@ -161,7 +179,7 @@ export function generatePrevCursor(firstRow, cursorField) {
  */
 export function decodeCursor(cursor) {
     if (!cursor) return null;
-    
+
     try {
         return JSON.parse(Buffer.from(cursor, 'base64').toString('utf8'));
     } catch (err) {
@@ -177,7 +195,7 @@ export function decodeCursor(cursor) {
  * @returns {string} - Formatted markdown text
  */
 export function formatPaginationMetadata(pagination, sql) {
-    const { 
+    const {
         pageSize,
         returnedRows,
         hasMore,
@@ -185,18 +203,18 @@ export function formatPaginationMetadata(pagination, sql) {
         prevCursor,
         cursorField
     } = pagination;
-    
+
     let text = `## Pagination\n\n`;
     text += `- **Page Size**: ${pageSize}\n`;
     text += `- **Returned Rows**: ${returnedRows}\n`;
     text += `- **Has More**: ${hasMore ? 'Yes' : 'No'}\n`;
-    
+
     if (cursorField) {
         text += `- **Cursor Field**: ${cursorField}\n`;
     }
-    
+
     text += '\n';
-    
+
     if (nextCursor) {
         text += `### Next Page\n\n`;
         text += `To fetch the next page, use:\n`;
@@ -209,7 +227,7 @@ export function formatPaginationMetadata(pagination, sql) {
 })\n`;
         text += `\`\`\`\n\n`;
     }
-    
+
     if (prevCursor) {
         text += `### Previous Page\n\n`;
         text += `To fetch the previous page, use:\n`;
@@ -222,7 +240,7 @@ export function formatPaginationMetadata(pagination, sql) {
 })\n`;
         text += `\`\`\`\n`;
     }
-    
+
     return text;
 }
 
@@ -234,38 +252,38 @@ export function formatPaginationMetadata(pagination, sql) {
 export function extractDefaultCursorField(sql) {
     // Try to extract from ORDER BY clause
     const orderByMatch = sql.match(/ORDER\s+BY\s+([^)]+?)(?:\s+OFFSET|\s+FOR\s+JSON|\s+FOR\s+XML|\s*$)/i);
-    
+
     if (orderByMatch) {
         const orderByClause = orderByMatch[1].trim();
         const firstOrderField = orderByClause.split(',')[0].trim();
         // Extract just the field name, not the ASC/DESC part
         return firstOrderField.split(/\s+/)[0].replace(/\[|\]/g, '');
     }
-    
+
     // Try to extract from SELECT clause for potential primary key fields
     const commonIdFields = ['id', 'ID', 'Id', 'key', 'KEY', 'Key', 'primary_key', 'PrimaryKey'];
     const selectMatch = sql.match(/SELECT\s+(.+?)\s+FROM/is);
-    
+
     if (selectMatch) {
         const selectClause = selectMatch[1].trim();
         // If not SELECT *, try to find ID fields
         if (selectClause !== '*') {
             const fields = selectClause.split(',').map(f => f.trim());
-            
+
             // Check for common ID field names
             for (const idField of commonIdFields) {
                 const matchingField = fields.find(f => {
                     const cleanField = f.split(/\s+AS\s+|\s+/).pop().replace(/\[|\]/g, '');
                     return cleanField.toLowerCase() === idField.toLowerCase();
                 });
-                
+
                 if (matchingField) {
                     return matchingField.split(/\s+AS\s+|\s+/).pop().replace(/\[|\]/g, '');
                 }
             }
         }
     }
-    
+
     // Default to 'id' if no suitable field found
     return 'id';
 }

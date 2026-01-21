@@ -36,7 +36,7 @@ const EXAMPLE_FILE = path.join(__dirname, 'multi-db-config.example.json');
  */
 function substituteEnvironmentVariables(str) {
     if (typeof str !== 'string') return str;
-    
+
     return str.replace(/\$\{([^}]+)\}/g, (match, envVar) => {
         const value = process.env[envVar];
         if (value === undefined) {
@@ -55,13 +55,13 @@ function substituteEnvironmentVariables(str) {
  */
 function convertToProperType(key, value) {
     if (typeof value !== 'string') return value;
-    
+
     // Convert port to number
     if (key === 'port') {
         const num = parseInt(value);
         return isNaN(num) ? 1433 : num;
     }
-    
+
     // Return as string for everything else (server, database, user, password)
     return value;
 }
@@ -95,52 +95,52 @@ async function loadMultiDatabaseConfig() {
     try {
         // Check if config file exists
         if (!fs.existsSync(CONFIG_FILE)) {
-            console.log('❌ Configuration file not found: multi-db-config.json');
-            
+            console.error('❌ Configuration file not found: multi-db-config.json');
+
             if (fs.existsSync(EXAMPLE_FILE)) {
-                console.log('📝 Example file found. Run: npm run setup-multi-db');
-                console.log('   Then edit multi-db-config.json with your database details');
+                console.error('📝 Example file found. Run: npm run setup-multi-db');
+                console.error('   Then edit multi-db-config.json with your database details');
             }
-            
+
             return false;
         }
-        
+
         // Read and parse configuration
         const configContent = fs.readFileSync(CONFIG_FILE, 'utf8');
         const rawConfig = JSON.parse(configContent);
-        
+
         // Process environment variables and convert types
         const config = processEnvironmentVariables(rawConfig);
-        
+
         if (!config.databases || !Array.isArray(config.databases)) {
-            console.log('❌ Invalid configuration: "databases" array not found');
+            console.error('❌ Invalid configuration: "databases" array not found');
             return false;
         }
-        
-        console.log(`📋 Loading ${config.databases.length} database configurations...`);
-        
+
+        console.error(`📋 Loading ${config.databases.length} database configurations...`);
+
         let successCount = 0;
         let failureCount = 0;
         const missingEnvVars = new Set();
-        
+
         // Register each database
         for (const dbConfig of config.databases) {
             try {
                 // Validate required fields
                 const requiredFields = ['id', 'server', 'database', 'user', 'password'];
                 const missingFields = requiredFields.filter(field => !dbConfig[field]);
-                
+
                 if (missingFields.length > 0) {
-                    console.log(`❌ ${dbConfig.id || 'Unknown'}: Missing required fields: ${missingFields.join(', ')}`);
+                    console.error(`❌ ${dbConfig.id || 'Unknown'}: Missing required fields: ${missingFields.join(', ')}`);
                     failureCount++;
                     continue;
                 }
-                
+
                 // Check for unresolved environment variables
-                const stillHasEnvVars = requiredFields.some(field => 
+                const stillHasEnvVars = requiredFields.some(field =>
                     typeof dbConfig[field] === 'string' && dbConfig[field].includes('${')
                 );
-                
+
                 if (stillHasEnvVars) {
                     const envVarMatches = JSON.stringify(dbConfig).match(/\$\{([^}]+)\}/g);
                     if (envVarMatches) {
@@ -149,11 +149,11 @@ async function loadMultiDatabaseConfig() {
                             missingEnvVars.add(envVar);
                         });
                     }
-                    console.log(`❌ ${dbConfig.id}: Unresolved environment variables found`);
+                    console.error(`❌ ${dbConfig.id}: Unresolved environment variables found`);
                     failureCount++;
                     continue;
                 }
-                
+
                 // Prepare config for registration with proper types
                 const dbConnectionConfig = {
                     user: dbConfig.user,
@@ -173,47 +173,47 @@ async function loadMultiDatabaseConfig() {
                         }
                     }
                 };
-                
+
                 // Log configuration details (without sensitive info)
                 logger.info(`Processing ${dbConfig.id}: ${dbConfig.server}:${dbConnectionConfig.port}/${dbConnectionConfig.database} (encrypt: ${dbConnectionConfig.options.encrypt})`);
-                
+
                 // Register the database
                 const success = registerDatabase(dbConfig.id, dbConnectionConfig);
-                
+
                 if (success) {
-                    console.log(`✅ ${dbConfig.id}: ${dbConfig.name || dbConfig.id} (${dbConfig.server}/${dbConfig.database})`);
+                    console.error(`✅ ${dbConfig.id}: ${dbConfig.name || dbConfig.id} (${dbConfig.server}/${dbConfig.database})`);
                     successCount++;
                 } else {
-                    console.log(`❌ ${dbConfig.id}: Registration failed`);
+                    console.error(`❌ ${dbConfig.id}: Registration failed`);
                     failureCount++;
                 }
-                
+
             } catch (err) {
-                console.log(`❌ ${dbConfig.id || 'Unknown'}: ${err.message}`);
+                console.error(`❌ ${dbConfig.id || 'Unknown'}: ${err.message}`);
                 failureCount++;
             }
         }
-        
+
         // Print summary
-        console.log('\n📊 Registration Summary:');
-        console.log(`   ✅ Successful: ${successCount}`);
-        console.log(`   ❌ Failed: ${failureCount}`);
-        
+        console.error('\n📊 Registration Summary:');
+        console.error(`   ✅ Successful: ${successCount}`);
+        console.error(`   ❌ Failed: ${failureCount}`);
+
         // Show missing environment variables
         if (missingEnvVars.size > 0) {
-            console.log('\n🔐 Missing Environment Variables:');
+            console.error('\n🔐 Missing Environment Variables:');
             const sortedVars = Array.from(missingEnvVars).sort();
             for (const envVar of sortedVars) {
-                console.log(`   export ${envVar}="your_value_here"`);
+                console.error(`   export ${envVar}="your_value_here"`);
             }
-            console.log('\n💡 Tip: Copy env.example to .env and fill in your values:');
-            console.log('   cp env.example .env');
-            console.log('   chmod 600 .env');
-            console.log('   # Edit .env with your actual values');
+            console.error('\n💡 Tip: Copy env.example to .env and fill in your values:');
+            console.error('   cp env.example .env');
+            console.error('   chmod 600 .env');
+            console.error('   # Edit .env with your actual values');
         }
-        
+
         return successCount > 0;
-        
+
     } catch (err) {
         console.error('❌ Failed to load multi-database configuration:', err.message);
         return false;
@@ -230,10 +230,10 @@ export { loadMultiDatabaseConfig };
 if (import.meta.url === `file://${process.argv[1]}`) {
     loadMultiDatabaseConfig().then(success => {
         if (success) {
-            console.log('\n🎉 Multi-database configuration loaded successfully!');
-            console.log('   You can now use the registered databases in your MCP server.');
+            console.error('\n🎉 Multi-database configuration loaded successfully!');
+            console.error('   You can now use the registered databases in your MCP server.');
         } else {
-            console.log('\n❌ Failed to load any database configurations.');
+            console.error('\n❌ Failed to load any database configurations.');
             process.exit(1);
         }
     });

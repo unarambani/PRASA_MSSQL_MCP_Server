@@ -1,107 +1,63 @@
-import fetch from 'node-fetch';
-import EventSource from 'eventsource';
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 
-const SERVER_URL = 'http://localhost:3333';
-const SSE_ENDPOINT = `${SERVER_URL}/sse`;
+async function main() {
+  console.log('🚀 Starting MCP SSE Connectivity Test...');
 
-// Setup variables
-let sessionId = null;
-let messagesEndpoint = null;
+  const transport = new SSEClientTransport(
+    new URL("http://localhost:3333/sse")
+  );
 
-console.log('Starting SSE connection test...');
+  const client = new Client(
+    { name: "test-client-sse", version: "1.0.0" },
+    { capabilities: {} }
+  );
 
-// 1. Connect to SSE endpoint
-const eventSource = new EventSource(SSE_ENDPOINT);
-
-// Handle SSE connection
-eventSource.onopen = () => {
-  console.log('✅ SSE connection established');
-};
-
-// Handle errors
-eventSource.onerror = (error) => {
-  console.error('❌ SSE connection error:', error);
-};
-
-// Handle the endpoint event (receives the messages endpoint)
-eventSource.addEventListener('endpoint', (event) => {
   try {
-    messagesEndpoint = decodeURI(event.data);
-    console.log(`✅ Received messages endpoint: ${messagesEndpoint}`);
-    
-    // Extract session ID from the URL
-    const url = new URL(messagesEndpoint, SERVER_URL);
-    sessionId = url.searchParams.get('sessionId');
-    console.log(`✅ Session ID: ${sessionId}`);
-    
-    // Wait a bit then send a test query
-    setTimeout(sendTestQuery, 2000);
-  } catch (err) {
-    console.error('❌ Error processing endpoint event:', err);
-  }
-});
+    console.log('🔌 Connecting to MCP server via SSE...');
+    await client.connect(transport);
+    console.log('✅ Connected to MCP server');
 
-// Listen for all messages from the server
-eventSource.addEventListener('message', (event) => {
-  try {
-    console.log('📥 Received SSE message:');
-    const data = JSON.parse(event.data);
-    console.log(JSON.stringify(data, null, 2));
-    
-    // Check if this is a response to our tool call
-    if (data.id === '1' && data.result) {
-      console.log('✅ Received response to our tool call!');
-      
-      // Close the connection after receiving the response
-      setTimeout(() => {
-        console.log('Closing connection...');
-        eventSource.close();
-        process.exit(0);
-      }, 2000);
-    }
-  } catch (err) {
-    console.error('❌ Error processing message event:', err.message);
-    console.log('Raw message data:', event.data);
-  }
-});
+    const regions = ['gp', 'kzn', 'el', 'pe', 'cpt'];
 
-// Function to send a test query
-async function sendTestQuery() {
-  try {
-    console.log('📤 Sending test SQL query...');
-    
-    const response = await fetch(messagesEndpoint, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: '1',
-        method: 'tools/call',
-        params: {
-          name: 'SQL_execute_query',
-          parameters: {
-            sql: 'SELECT TOP 5 name FROM sys.tables'
-          }
+    for (const region of regions) {
+      console.log(`\n----------------------------------------`);
+      console.log(`🔎 Testing connectivity for region: ${region.toUpperCase()}...`);
+
+      try {
+        // Set a timeout for each query
+        const queryPromise = client.callTool("mcp_SQL_execute_query", {
+          sql: "SELECT 1 as connection_test, @@SERVERNAME as server_name, 'SSE Works' as status",
+          databaseId: region
+        });
+
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Query timed out')), 20000)
+        );
+
+        const result = await Promise.race([queryPromise, timeoutPromise]);
+
+        console.log(`✅ ${region.toUpperCase()}: Success!`);
+        if (result.content && result.content[0] && result.content[0].text) {
+          console.log(`   Response: ${result.content[0].text.trim()}`);
+        } else {
+          console.log(`   Response: ${JSON.stringify(result)}`);
         }
-      })
-    });
-    
-    const responseText = await response.text();
-    console.log(`✅ Query sent, server responded with status ${response.status}:`, responseText);
-    
-    if (response.status !== 202) {
-      console.error('❌ Expected status 202 (Accepted)');
+
+      } catch (err) {
+        console.log(`❌ ${region.toUpperCase()}: Failed`);
+        console.log(`   Error: ${err.message}`);
+      }
     }
-  } catch (err) {
-    console.error('❌ Error sending test query:', err.message);
+
+  } catch (error) {
+    console.error('❌ Fatal error:', error);
+  } finally {
+    console.log(`\n----------------------------------------`);
+    console.log('🛑 Closing connection...');
+    await client.close(); // This might hang if SSE doesn't close cleanly, but fine for script
+    process.exit(0);
   }
 }
 
-// Exit handler
-process.on('SIGINT', () => {
-  console.log('Closing SSE connection...');
-  eventSource.close();
-  process.exit();
-}); 
+main();
