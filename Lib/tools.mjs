@@ -37,6 +37,48 @@ dotenv.config({ path: path.join(__dirname, '../.env') });
 // Configuration
 const QUERY_RESULTS_PATH = process.env.QUERY_RESULTS_PATH || path.join(__dirname, '../query_results');
 
+function resolveOutputPath(outputFile, outputFormat) {
+    if (!outputFile) return null;
+
+    const desiredExt = outputFormat === 'csv' ? '.csv' : '.json';
+    const denyList = ['/etc', '/bin', '/usr', '/System', '/Library', '/Applications']
+        .map(dir => path.resolve(dir));
+
+    let candidate = outputFile;
+    const looksLikeDir = candidate.endsWith(path.sep) || candidate.endsWith('/') || candidate.endsWith('\\');
+
+    if (!looksLikeDir && !path.extname(candidate)) {
+        candidate += desiredExt;
+    }
+
+    let resolved = path.isAbsolute(candidate)
+        ? path.resolve(candidate)
+        : path.resolve(QUERY_RESULTS_PATH, candidate);
+
+    for (const blockedDir of denyList) {
+        if (resolved === blockedDir || resolved.startsWith(blockedDir + path.sep)) {
+            return { error: `Output path is not allowed: ${blockedDir}` };
+        }
+    }
+
+    if (looksLikeDir || (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory())) {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const filename = `query-results-${timestamp}-${crypto.randomUUID()}${desiredExt}`;
+        resolved = path.join(resolved, filename);
+    }
+
+    const ext = path.extname(resolved).toLowerCase();
+    if (ext && ext !== '.json' && ext !== '.csv') {
+        return { error: `Output extension must be .json or .csv` };
+    }
+
+    if (!ext) {
+        resolved += desiredExt;
+    }
+
+    return { path: resolved };
+}
+
 /**
  * Register all database tools
  * @param {object} server - MCP server instance
@@ -381,6 +423,8 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
         maxRows: z.number().min(1).max(10000).optional().default(1000),
         parameters: z.record(z.any()).optional(),
         databaseId: z.string().optional(),
+        outputFile: z.string().optional(),
+        outputFormat: z.enum(['json', 'csv']).optional().default('json'),
         // Pagination parameters
         pageSize: z.number().min(1).max(1000).optional(),
         cursor: z.string().optional(),
@@ -395,6 +439,8 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
             maxRows = 1000,
             parameters = {},
             databaseId,
+            outputFile,
+            outputFormat = 'json',
             pageSize,
             cursor,
             cursorField,
@@ -475,6 +521,69 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
                 }
             }
 
+            let outputPath = null;
+            if (outputFile) {
+                const resolvedOutput = resolveOutputPath(outputFile, outputFormat);
+                if (resolvedOutput?.error) {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Error writing output file: ${resolvedOutput.error}`
+                        }],
+                        isError: true
+                    };
+                }
+
+                outputPath = resolvedOutput.path;
+                try {
+                    if (outputFormat === 'csv') {
+                        if (rowCount === 0) {
+                            fs.writeFileSync(outputPath, '');
+                        } else {
+                            const columns = Object.keys(result.recordset[0]);
+                            const lines = [];
+                            lines.push(columns.join(','));
+
+                            result.recordset.forEach(row => {
+                                const line = columns.map(col => {
+                                    const value = row[col];
+                                    if (value === null || value === undefined) return '';
+                                    if (typeof value === 'string') return `"${value.replace(/"/g, '""')}"`;
+                                    if (typeof value === 'object') return `"${JSON.stringify(value).replace(/"/g, '""')}"`;
+                                    return String(value);
+                                }).join(',');
+                                lines.push(line);
+                            });
+
+                            fs.writeFileSync(outputPath, lines.join('\n'));
+                        }
+                    } else {
+                        const resultWithMetadata = {
+                            metadata: {
+                                timestamp: new Date().toISOString(),
+                                query: sql,
+                                parameters: Object.keys(parameters).length > 0 ? parameters : undefined,
+                                rowCount,
+                                executionTimeMs: executionTime
+                            },
+                            results: result.recordset || []
+                        };
+                        fs.writeFileSync(outputPath, JSON.stringify(resultWithMetadata, null, 2));
+                    }
+
+                    logger.info(`Query results written to ${outputPath}`);
+                } catch (writeError) {
+                    logger.error(`Error writing output file: ${writeError.message}`);
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Error writing output file: ${writeError.message}`
+                        }],
+                        isError: true
+                    };
+                }
+            }
+
             // Generate UUID for tracking
             const uuid = crypto.randomUUID();
 
@@ -482,7 +591,9 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
             return {
                 content: [{
                     type: "text",
-                    text: responseText
+                    text: outputPath
+                        ? `${responseText}\n\n📄 Output written to: ${outputPath}`
+                        : responseText
                 }],
                 result: {
                     rowCount: rowCount,
@@ -491,7 +602,8 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
                         uuid: uuid,
                         pagination: null,
                         totalCount: totalCount,
-                        executionTimeMs: executionTime
+                        executionTimeMs: executionTime,
+                        outputPath
                     }
                 }
             };
