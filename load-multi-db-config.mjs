@@ -160,7 +160,6 @@ async function loadMultiDatabaseConfig() {
                     password: dbConfig.password,
                     server: dbConfig.server,
                     database: dbConfig.database,
-                    port: dbConfig.port || 1433,
                     options: {
                         encrypt: dbConfig.options?.encrypt !== undefined ? dbConfig.options.encrypt : false,
                         trustServerCertificate: dbConfig.options?.trustServerCertificate !== undefined ? dbConfig.options.trustServerCertificate : true,
@@ -174,8 +173,15 @@ async function loadMultiDatabaseConfig() {
                     }
                 };
 
+                // Only pass port when explicitly provided in config.
+                // For named instances (server\\instance), forcing 1433 can break SQL Browser lookup.
+                if (dbConfig.port !== undefined && dbConfig.port !== null && dbConfig.port !== '') {
+                    dbConnectionConfig.port = dbConfig.port;
+                }
+
                 // Log configuration details (without sensitive info)
-                logger.info(`Processing ${dbConfig.id}: ${dbConfig.server}:${dbConnectionConfig.port}/${dbConnectionConfig.database} (encrypt: ${dbConnectionConfig.options.encrypt})`);
+                const portText = dbConnectionConfig.port !== undefined ? `:${dbConnectionConfig.port}` : '';
+                logger.info(`Processing ${dbConfig.id}: ${dbConfig.server}${portText}/${dbConnectionConfig.database} (encrypt: ${dbConnectionConfig.options.encrypt})`);
 
                 // Register the database
                 const success = registerDatabase(dbConfig.id, dbConnectionConfig);

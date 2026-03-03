@@ -189,6 +189,21 @@ Optimized connection management with:
 - Automatic reconnection on failures
 - Configurable timeout settings
 
+### Safety, Approvals, and Limits
+- **Local write access**: Writes are allowed on databases identified as local (by `databaseId` or host).
+- **Write approvals**: Non-local data-altering queries require a short-lived approval token.
+- **Row guardrails**: Optional `maxEstimatedRows` to block large result sets.
+- **Timeouts**: Optional per-query timeout for tools.
+
+Environment variables:
+- `LOCAL_DATABASE_IDS` (default: `local`)
+- `LOCAL_HOSTS` (default: `localhost,127.0.0.1,::1`)
+- `WRITE_APPROVAL_TTL_MS` (default: `300000`)
+- `SLOW_QUERY_MS` (default: `2000`)
+- `MULTI_DB_MAX` (default: `10`)
+- `MULTI_DB_CONCURRENCY` (default: `4`)
+- `SCHEMA_CACHE_TTL_SECONDS` (default: `300`)
+
 ## 📋 Team Setup & Management
 
 ### New Team Member Onboarding

@@ -1,7 +1,40 @@
 // lib/resources.js - Database resource implementations
 import { executeQuery, sanitizeSqlIdentifier, formatSqlError } from './database.mjs';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { logger } from './logger.mjs';
 import { createJsonRpcError } from './errors.mjs';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const QUERY_RESULTS_PATH = process.env.QUERY_RESULTS_PATH || path.join(__dirname, '../query_results');
+const SCHEMA_CACHE_TTL_SECONDS = parseInt(process.env.SCHEMA_CACHE_TTL_SECONDS || '300', 10);
+const SCHEMA_CACHE_FILE = path.join(QUERY_RESULTS_PATH, 'schema-cache.json');
+
+function readSchemaCache() {
+    if (!fs.existsSync(SCHEMA_CACHE_FILE)) return null;
+    try {
+        const cached = JSON.parse(fs.readFileSync(SCHEMA_CACHE_FILE, 'utf8'));
+        const ageMs = Date.now() - new Date(cached.timestamp).getTime();
+        if (ageMs > SCHEMA_CACHE_TTL_SECONDS * 1000) return null;
+        return cached.text || null;
+    } catch {
+        return null;
+    }
+}
+
+function writeSchemaCache(text) {
+    try {
+        const data = {
+            timestamp: new Date().toISOString(),
+            text
+        };
+        fs.writeFileSync(SCHEMA_CACHE_FILE, JSON.stringify(data, null, 2));
+    } catch (err) {
+        logger.warn(`Failed to write schema cache: ${err.message}`);
+    }
+}
 
 /**
  * Register all database-related resources with the MCP server
@@ -63,6 +96,17 @@ function registerDatabaseSchemaResource(server) {
         async (uri) => {
             try {
                 logger.info('Fetching database schema...');
+
+                const cached = readSchemaCache();
+                if (cached) {
+                    logger.info('Schema cache hit');
+                    return {
+                        contents: [{
+                            uri: uri.href,
+                            text: cached
+                        }]
+                    };
+                }
                 
                 const result = await executeQuery(`
                     SELECT 
@@ -80,6 +124,7 @@ function registerDatabaseSchemaResource(server) {
                 
                 // Format schema data into human-readable text
                 const formattedSchema = formatSchemaData(result.recordset);
+                writeSchemaCache(formattedSchema);
                 logger.info('Schema retrieved successfully');
                 
                 return {

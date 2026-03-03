@@ -13,6 +13,8 @@ export function registerPrompts(server) {
     registerGenerateQueryPrompt(server);
     registerExplainQueryPrompt(server);
     registerCreateTablePrompt(server);
+    registerSafeSelectPrompt(server);
+    registerParameterizedQueryPrompt(server);
     
     logger.info('Prompts registered successfully');
 }
@@ -126,6 +128,78 @@ The CREATE TABLE statement should:
 8. Follow SQL Server best practices
 
 Please provide just the CREATE TABLE statement without explanations.`
+                    }
+                }]
+            };
+        }
+    );
+}
+
+/**
+ * Register a safe-select prompt
+ * @param {object} server - MCP server instance
+ */
+function registerSafeSelectPrompt(server) {
+    server.prompt(
+        "safe-select",
+        {
+            description: z.string().min(1, "Description cannot be empty"),
+            tables: z.array(z.string()).optional(),
+            limit: z.number().optional().default(100)
+        },
+        ({ description, tables, limit = 100 }) => {
+            const tablesContext = tables && tables.length > 0
+                ? `Use these tables: ${tables.join(', ')}.`
+                : 'Use appropriate tables from the database.';
+
+            return {
+                messages: [{
+                    role: "user",
+                    content: {
+                        type: "text",
+                        text: `Write a safe, read-only SQL Server query that ${description}. ${tablesContext}
+
+Requirements:
+1. Use TOP ${limit}
+2. Include a WHERE clause (avoid full table scans)
+3. Avoid SELECT *
+4. Use deterministic ORDER BY if applicable
+5. Return only the SQL`
+                    }
+                }]
+            };
+        }
+    );
+}
+
+/**
+ * Register a parameterized-query prompt
+ * @param {object} server - MCP server instance
+ */
+function registerParameterizedQueryPrompt(server) {
+    server.prompt(
+        "parameterized-query",
+        {
+            description: z.string().min(1, "Description cannot be empty"),
+            tables: z.array(z.string()).optional()
+        },
+        ({ description, tables }) => {
+            const tablesContext = tables && tables.length > 0
+                ? `Use these tables: ${tables.join(', ')}.`
+                : 'Use appropriate tables from the database.';
+
+            return {
+                messages: [{
+                    role: "user",
+                    content: {
+                        type: "text",
+                        text: `Write a SQL Server query and a parameters object for: ${description}. ${tablesContext}
+
+Requirements:
+1. Use named parameters (e.g., @startDate)
+2. Avoid SELECT *
+3. Include a WHERE clause with parameters
+4. Return the SQL first, then a JSON parameters object`
                     }
                 }]
             };

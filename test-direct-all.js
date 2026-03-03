@@ -47,7 +47,6 @@ const configs = {
         password: process.env.GP_PASSWORD,
         server: process.env.GP_SERVER,
         database: process.env.GP_DB,
-        port: 1433, // Defaulting even for named instance if resolved
         options: { encrypt: false, trustServerCertificate: true, connectionTimeout: 5000 }
     }
 };
@@ -76,10 +75,18 @@ async function checkRegion(name, config) {
 async function main() {
     console.log('🚀 Starting Direct MSSQL Connectivity Test...');
 
-    // Fix GP server if it has instance name backslashes which might need escaping in JS string if not careful, 
-    // but dotenv handles it. 
-    // However, for Named Instances, we might need to enable browser service or dynamic ports.
-    // For this test, we assume standard port or 1433.
+    // Handle named instances like "host\\INSTANCE" for the mssql driver.
+    const gpServer = configs.gp.server;
+    if (typeof gpServer === 'string' && gpServer.includes('\\')) {
+        const [host, instanceName] = gpServer.split('\\', 2);
+        if (host && instanceName) {
+            configs.gp.server = host;
+            configs.gp.options.instanceName = instanceName;
+            delete configs.gp.port;
+        }
+    } else {
+        configs.gp.port = parseInt(process.env.GP_PORT) || 1433;
+    }
 
     for (const [region, config] of Object.entries(configs)) {
         await checkRegion(region, config);

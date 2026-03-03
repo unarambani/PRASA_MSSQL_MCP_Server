@@ -9,7 +9,9 @@ import { logger } from './logger.mjs';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-dotenv.config({ path: path.join(__dirname, '../.env') });
+// Force project-local .env values to override inherited shell/IDE env vars.
+// This prevents stale exported credentials from causing region login failures.
+dotenv.config({ path: path.join(__dirname, '../.env'), override: true });
 
 // Database configurations - support multiple databases
 const databaseConfigs = {};
@@ -62,7 +64,6 @@ export function registerDatabase(databaseId, config) {
         // Set default values for optional fields
         const fullConfig = {
             ...config,
-            port: config.port || 1433,
             options: {
                 encrypt: config.options?.encrypt || false,
                 trustServerCertificate: config.options?.trustServerCertificate !== false,
@@ -76,8 +77,31 @@ export function registerDatabase(databaseId, config) {
             }
         };
 
+        // Named instance support: convert "host\\instance" into server + options.instanceName.
+        // This aligns with the mssql driver expected config and avoids hard-forcing port 1433.
+        if (typeof fullConfig.server === 'string' && fullConfig.server.includes('\\')) {
+            const [host, instanceName] = fullConfig.server.split('\\', 2);
+            if (host && instanceName) {
+                fullConfig.server = host;
+                if (!fullConfig.options.instanceName) {
+                    fullConfig.options.instanceName = instanceName;
+                }
+            }
+        }
+
+        // Preserve explicit ports, otherwise default to 1433 only when not using instance lookup.
+        if (config.port !== undefined && config.port !== null && config.port !== '') {
+            fullConfig.port = parseInt(config.port, 10) || 1433;
+        } else if (!fullConfig.options.instanceName) {
+            fullConfig.port = 1433;
+        } else {
+            delete fullConfig.port;
+        }
+
         databaseConfigs[databaseId] = fullConfig;
-        logger.info(`Registered database: ${databaseId} (${config.server}/${config.database})`);
+        const instanceSuffix = fullConfig.options.instanceName ? `\\${fullConfig.options.instanceName}` : '';
+        const portSuffix = fullConfig.port ? `:${fullConfig.port}` : '';
+        logger.info(`Registered database: ${databaseId} (${fullConfig.server}${instanceSuffix}${portSuffix}/${fullConfig.database})`);
         return true;
     } catch (err) {
         logger.error(`Failed to register database ${databaseId}: ${err.message}`);
@@ -135,32 +159,46 @@ export async function initializeDbPool(databaseId = null) {
         throw new Error(`Database configuration not found: ${dbId}`);
     }
 
-    try {
-        const config = databaseConfigs[dbId];
-        // DEBUG: Log config details
-        logger.info(`DEBUG: Pool Config for ${dbId}: user=${config.user}, server=${config.server}, port=${config.port}, database=${config.database}`);
-        logger.info(`DEBUG: Options: ${JSON.stringify(config.options)}`);
+    const config = databaseConfigs[dbId];
+    // DEBUG: Log config details
+    logger.info(`DEBUG: Pool Config for ${dbId}: user=${config.user}, server=${config.server}, port=${config.port}, database=${config.database}`);
+    logger.info(`DEBUG: Options: ${JSON.stringify(config.options)}`);
 
-        logger.info(`Initializing SQL Server connection pool for: ${dbId}...`);
+    const maxAttempts = parseInt(process.env.DB_CONNECT_RETRIES || '3', 10);
+    const retryDelayMs = parseInt(process.env.DB_CONNECT_RETRY_DELAY_MS || '1000', 10);
 
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            logger.info(`Initializing SQL Server connection pool for: ${dbId} (attempt ${attempt}/${maxAttempts})...`);
 
+            // Create and connect the pool
+            const pool = await new sql.ConnectionPool(config).connect();
 
-        // Create and connect the pool
-        const pool = await new sql.ConnectionPool(config).connect();
+            // Setup pool error handler
+            pool.on('error', err => {
+                logger.error(`SQL Pool Error (${dbId}): ${err.message}`);
+            });
 
-        // Setup pool error handler
-        pool.on('error', err => {
-            logger.error(`SQL Pool Error (${dbId}): ${err.message}`);
-        });
+            sqlPools[dbId] = pool;
 
-        sqlPools[dbId] = pool;
+            logger.info(`SQL Server connection pool initialized successfully for ${dbId} (${config.server}/${config.database})`);
+            return true;
+        } catch (err) {
+            const transientCodes = new Set(['ETIMEOUT', 'ESOCKET', 'EINSTLOOKUP']);
+            const isTransient = transientCodes.has(err.code) || /timed out|instance|lookup/i.test(err.message || '');
+            const hasAttemptsLeft = attempt < maxAttempts;
 
-        logger.info(`SQL Server connection pool initialized successfully for ${dbId} (${config.server}/${config.database})`);
-        return true;
-    } catch (err) {
-        logger.error(`Failed to initialize SQL Server connection pool for ${dbId}: ${err.message}`);
-        throw err;
+            logger.error(`Failed to initialize SQL Server connection pool for ${dbId} (attempt ${attempt}/${maxAttempts}): ${err.message}`);
+
+            if (!isTransient || !hasAttemptsLeft) {
+                throw err;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        }
     }
+
+    throw new Error(`Failed to initialize SQL Server connection pool for ${dbId}`);
 }
 
 /**
@@ -194,7 +232,7 @@ async function ensurePoolConnected(databaseId = null) {
  * @param {string} databaseId - Optional database ID to execute against
  * @returns {Promise<object>} - Query result
  */
-export async function executeQuery(sqlQuery, parameters = {}, retryCount = 3, databaseId = null) {
+export async function executeQuery(sqlQuery, parameters = {}, retryCount = 3, databaseId = null, timeoutMs = null, dryRun = false) {
     const dbId = databaseId || currentDatabaseId;
 
     if (sqlQuery.length > 100) {
@@ -207,6 +245,9 @@ export async function executeQuery(sqlQuery, parameters = {}, retryCount = 3, da
 
     try {
         const request = sqlPools[dbId].request();
+        if (timeoutMs) {
+            request.timeout = timeoutMs;
+        }
 
         // Add parameters if provided
         for (const [key, value] of Object.entries(parameters)) {
@@ -214,7 +255,18 @@ export async function executeQuery(sqlQuery, parameters = {}, retryCount = 3, da
         }
 
         const startTime = Date.now();
-        const result = await request.query(sqlQuery);
+        const sqlToRun = dryRun ? `SET SHOWPLAN_XML ON; ${sqlQuery}; SET SHOWPLAN_XML OFF;` : sqlQuery;
+        const queryPromise = request.query(sqlToRun);
+        const result = timeoutMs
+            ? await Promise.race([
+                queryPromise,
+                new Promise((_, reject) => {
+                    const timeoutError = new Error('Query timeout exceeded');
+                    timeoutError.code = 'ETIMEOUT';
+                    setTimeout(() => reject(timeoutError), timeoutMs);
+                })
+            ])
+            : await queryPromise;
         const executionTime = Date.now() - startTime;
 
         logger.info(`SQL executed successfully on ${dbId} in ${executionTime}ms, returned ${result.recordset?.length || 0} rows`);
@@ -315,7 +367,7 @@ export async function executeTransaction(queries, databaseId = null) {
  * @param {object} parameters - Query parameters
  * @returns {Promise<Array<object>>} - Array of results with database info
  */
-export async function executeQueryOnMultipleDatabases(sqlQuery, databaseIds, parameters = {}) {
+export async function executeQueryOnMultipleDatabases(sqlQuery, databaseIds, parameters = {}, options = {}) {
     if (!Array.isArray(databaseIds) || databaseIds.length === 0) {
         throw new Error('No database IDs provided');
     }
@@ -327,38 +379,48 @@ export async function executeQueryOnMultipleDatabases(sqlQuery, databaseIds, par
         }
     }
 
-    logger.info(`Executing query on ${databaseIds.length} databases: ${databaseIds.join(', ')}`);
+    const maxDatabases = parseInt(process.env.MULTI_DB_MAX || '10', 10);
+    if (databaseIds.length > maxDatabases) {
+        throw new Error(`Too many databases requested (${databaseIds.length}); max is ${maxDatabases}`);
+    }
 
-    // Execute queries in parallel
-    const promises = databaseIds.map(async (dbId) => {
+    const concurrency = Math.min(
+        options.concurrency || parseInt(process.env.MULTI_DB_CONCURRENCY || '4', 10),
+        databaseIds.length
+    );
+    logger.info(`Executing query on ${databaseIds.length} databases: ${databaseIds.join(', ')} (concurrency=${concurrency})`);
+
+    const results = [];
+    let index = 0;
+
+    const runNext = async () => {
+        if (index >= databaseIds.length) return;
+        const dbId = databaseIds[index++];
         try {
-            const result = await executeQuery(sqlQuery, parameters, 3, dbId);
-            return {
+            const result = await executeQuery(sqlQuery, parameters, 3, dbId, options.timeoutMs);
+            results.push({
                 databaseId: dbId,
                 success: true,
                 result: result,
                 server: databaseConfigs[dbId].server,
                 database: databaseConfigs[dbId].database
-            };
+            });
         } catch (err) {
             logger.error(`Query failed on database ${dbId}: ${err.message}`);
-            return {
+            results.push({
                 databaseId: dbId,
                 success: false,
                 error: err.message,
                 server: databaseConfigs[dbId].server,
                 database: databaseConfigs[dbId].database
-            };
+            });
         }
-    });
+        await runNext();
+    };
 
-    const results = await Promise.allSettled(promises);
+    await Promise.all(Array.from({ length: concurrency }, () => runNext()));
 
-    return results.map(result => result.status === 'fulfilled' ? result.value : {
-        databaseId: 'unknown',
-        success: false,
-        error: result.reason?.message || 'Unknown error'
-    });
+    return results;
 }
 
 /**

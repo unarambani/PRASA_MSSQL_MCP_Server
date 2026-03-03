@@ -17,7 +17,7 @@ const LOG_LEVEL = process.env.LOG_LEVEL || 'info';
 const LOG_FILE_PATH = process.env.LOG_FILE || path.join(__dirname, '../logs/mcp-server.log');
 const LOG_FILE = path.isAbsolute(LOG_FILE_PATH) ? LOG_FILE_PATH : path.resolve(path.join(__dirname, '..'), LOG_FILE_PATH);
 const LOG_MAX_SIZE = process.env.LOG_MAX_SIZE || '10m';
-const LOG_MAX_FILES = parseInt(process.env.LOG_MAX_FILES) || 5;
+const LOG_MAX_FILES = parseInt(process.env.LOG_MAX_FILES, 10) || 5;
 const LOG_FORMAT = process.env.LOG_FORMAT || 'json';
 
 // Create logs directory if it doesn't exist
@@ -51,6 +51,38 @@ const logFormats = {
     )
 };
 
+const parseSizeToBytes = (value) => {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return Math.max(1, Math.floor(value));
+    }
+
+    if (typeof value !== 'string') {
+        return 10 * 1024 * 1024;
+    }
+
+    const trimmed = value.trim();
+    if (!trimmed) {
+        return 10 * 1024 * 1024;
+    }
+
+    const match = trimmed.match(/^([0-9]+(?:\.[0-9]+)?)\s*([kmg])?b?$/i);
+    if (!match) {
+        return 10 * 1024 * 1024;
+    }
+
+    const amount = Number.parseFloat(match[1]);
+    if (!Number.isFinite(amount)) {
+        return 10 * 1024 * 1024;
+    }
+
+    const unit = (match[2] || '').toLowerCase();
+    const multiplier = unit === 'g' ? 1024 ** 3 : unit === 'm' ? 1024 ** 2 : unit === 'k' ? 1024 : 1;
+
+    return Math.max(1, Math.floor(amount * multiplier));
+};
+
+const LOG_MAX_SIZE_BYTES = parseSizeToBytes(LOG_MAX_SIZE);
+
 // Create Winston logger
 export const logger = winston.createLogger({
     level: LOG_LEVEL,
@@ -65,7 +97,7 @@ export const logger = winston.createLogger({
         // File transport with rotation
         new winston.transports.File({
             filename: LOG_FILE,
-            maxsize: LOG_MAX_SIZE,
+            maxsize: LOG_MAX_SIZE_BYTES,
             maxFiles: LOG_MAX_FILES,
             tailable: true
         })

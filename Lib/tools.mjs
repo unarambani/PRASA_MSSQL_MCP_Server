@@ -3,6 +3,7 @@ import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import zlib from 'zlib';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
 import {
@@ -15,7 +16,8 @@ import {
     switchDatabase,
     getCurrentDatabaseId,
     executeQueryOnMultipleDatabases,
-    checkDatabaseHealth
+    checkDatabaseHealth,
+    getDbConfig
 } from './database.mjs';
 // Import new pagination utilities
 import {
@@ -36,6 +38,17 @@ dotenv.config({ path: path.join(__dirname, '../.env') });
 
 // Configuration
 const QUERY_RESULTS_PATH = process.env.QUERY_RESULTS_PATH || path.join(__dirname, '../query_results');
+const CACHE_DIR = path.join(QUERY_RESULTS_PATH, 'cache');
+const WRITE_APPROVAL_TTL_MS = parseInt(process.env.WRITE_APPROVAL_TTL_MS || '300000', 10);
+const SLOW_QUERY_MS = parseInt(process.env.SLOW_QUERY_MS || '2000', 10);
+const LOCAL_DATABASE_IDS = (process.env.LOCAL_DATABASE_IDS || 'local').split(',').map(s => s.trim()).filter(Boolean);
+const LOCAL_HOSTS = (process.env.LOCAL_HOSTS || 'localhost,127.0.0.1,::1').split(',').map(s => s.trim()).filter(Boolean);
+
+const writeApprovals = new Map();
+
+if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
 
 function resolveOutputPath(outputFile, outputFormat) {
     if (!outputFile) return null;
@@ -68,15 +81,167 @@ function resolveOutputPath(outputFile, outputFormat) {
     }
 
     const ext = path.extname(resolved).toLowerCase();
-    if (ext && ext !== '.json' && ext !== '.csv') {
+    const baseExt = ext === '.gz' ? path.extname(resolved.slice(0, -3)).toLowerCase() : ext;
+    if (baseExt && baseExt !== '.json' && baseExt !== '.csv') {
         return { error: `Output extension must be .json or .csv` };
     }
 
-    if (!ext) {
+    if (!baseExt) {
         resolved += desiredExt;
     }
 
     return { path: resolved };
+}
+
+function normalizeParameters(parameters) {
+    if (!parameters || typeof parameters !== 'object') return '{}';
+    const keys = Object.keys(parameters).sort();
+    const normalized = {};
+    for (const key of keys) {
+        normalized[key] = parameters[key];
+    }
+    return JSON.stringify(normalized);
+}
+
+function normalizeSqlForApproval(sql) {
+    if (!sql || typeof sql !== 'string') return '';
+    return sql
+        .replace(/--.*$/gm, '')
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .replace(/\s+/g, ' ')
+        .replace(/;+$/g, '')
+        .trim()
+        .toLowerCase();
+}
+
+function getApprovalKey(sql, parameters, databaseId) {
+    const hash = crypto.createHash('sha256');
+    hash.update(normalizeSqlForApproval(sql));
+    hash.update('|');
+    hash.update(normalizeParameters(parameters));
+    hash.update('|');
+    hash.update(databaseId || getCurrentDatabaseId());
+    return hash.digest('hex');
+}
+
+function createApprovalToken(sql, parameters, databaseId) {
+    const token = crypto.randomUUID();
+    const key = getApprovalKey(sql, parameters, databaseId);
+    const expiresAt = Date.now() + WRITE_APPROVAL_TTL_MS;
+    writeApprovals.set(token, { key, expiresAt });
+    return { token, expiresAt };
+}
+
+function validateApprovalToken(token, sql, parameters, databaseId) {
+    if (!token) return false;
+    const requestedApproval = String(token).trim().toLowerCase();
+    const isHumanApprovalShortcut = ['approved', 'approve', 'yes', 'y', 'true'].includes(requestedApproval);
+
+    if (!writeApprovals.has(token)) {
+        if (!isHumanApprovalShortcut) return false;
+
+        // UX fallback: allow explicit human approval words to confirm the
+        // most recent matching pending approval request for this exact query.
+        const key = getApprovalKey(sql, parameters, databaseId);
+        for (const [pendingToken, entry] of writeApprovals.entries()) {
+            if (!entry) continue;
+            if (entry.expiresAt < Date.now()) {
+                writeApprovals.delete(pendingToken);
+                continue;
+            }
+            if (entry.key === key) {
+                writeApprovals.delete(pendingToken);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    const entry = writeApprovals.get(token);
+    if (!entry || entry.expiresAt < Date.now()) {
+        writeApprovals.delete(token);
+        return false;
+    }
+
+    const key = getApprovalKey(sql, parameters, databaseId);
+    if (entry.key !== key) return false;
+
+    writeApprovals.delete(token);
+    return true;
+}
+
+function extractApprovalToken(args) {
+    if (!args || typeof args !== 'object') return undefined;
+    return args.approvalToken || args.approval_token;
+}
+
+function classifySqlOperation(sql) {
+    const normalized = sql.toLowerCase().replace(/--.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
+    const writeOps = ['insert', 'update', 'delete', 'merge', 'truncate'];
+    const ddlOps = ['alter', 'drop', 'create'];
+    const execOps = ['exec', 'execute'];
+
+    for (const op of writeOps) {
+        if (new RegExp(`\\b${op}\\b`).test(normalized)) return 'dml';
+    }
+    for (const op of ddlOps) {
+        if (new RegExp(`\\b${op}\\b`).test(normalized)) return 'ddl';
+    }
+    for (const op of execOps) {
+        if (new RegExp(`\\b${op}\\b`).test(normalized)) return 'exec';
+    }
+    return 'read';
+}
+
+function isLocalDatabase(databaseId) {
+    const dbId = databaseId || getCurrentDatabaseId();
+    if (LOCAL_DATABASE_IDS.includes(dbId)) return true;
+
+    try {
+        const config = getDbConfig(true, dbId);
+        const host = (config?.server || '').toLowerCase();
+        return LOCAL_HOSTS.includes(host);
+    } catch {
+        return false;
+    }
+}
+
+function getCacheKey(sql, parameters, databaseId) {
+    const hash = crypto.createHash('sha256');
+    hash.update(sql);
+    hash.update('|');
+    hash.update(normalizeParameters(parameters));
+    hash.update('|');
+    hash.update(databaseId || getCurrentDatabaseId());
+    return hash.digest('hex');
+}
+
+function readCache(cacheKey, ttlSeconds) {
+    if (!ttlSeconds || ttlSeconds <= 0) return null;
+    const cachePath = path.join(CACHE_DIR, `${cacheKey}.json`);
+    if (!fs.existsSync(cachePath)) return null;
+
+    try {
+        const data = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+        const ageMs = Date.now() - new Date(data.createdAt).getTime();
+        if (ageMs > ttlSeconds * 1000) return null;
+        return data.payload;
+    } catch {
+        return null;
+    }
+}
+
+function writeCache(cacheKey, payload) {
+    const cachePath = path.join(CACHE_DIR, `${cacheKey}.json`);
+    try {
+        const data = {
+            createdAt: new Date().toISOString(),
+            payload
+        };
+        fs.writeFileSync(cachePath, JSON.stringify(data, null, 2));
+    } catch (err) {
+        logger.warn(`Failed to write cache entry: ${err.message}`);
+    }
 }
 
 /**
@@ -339,28 +504,47 @@ function registerDatabaseManagementTools(server, registerWithAllAliases) {
         sql: z.string().min(1, "SQL query cannot be empty"),
         databaseIds: z.array(z.string()).min(1, "At least one database ID is required"),
         parameters: z.record(z.any()).optional(),
-        maxRows: z.number().min(1).max(10000).optional().default(1000)
+        maxRows: z.number().min(1).max(10000).optional().default(1000),
+        concurrency: z.number().min(1).max(20).optional(),
+        maxDatabases: z.number().min(1).max(100).optional(),
+        timeoutMs: z.number().min(1).max(600000).optional(),
+        requestId: z.string().optional()
     }, async (args) => {
-        const { sql, databaseIds, parameters = {}, maxRows = 1000 } = args;
+        const { sql, databaseIds, parameters = {}, maxRows = 1000, concurrency, maxDatabases, timeoutMs, requestId } = args;
 
         // Basic validation to prevent destructive operations
         const lowerSql = sql.toLowerCase();
-        const prohibitedOperations = ['drop ', 'delete ', 'truncate ', 'update ', 'alter '];
+        const prohibitedOperations = ['drop ', 'delete ', 'truncate ', 'update ', 'alter ', 'insert ', 'merge '];
 
         if (prohibitedOperations.some(op => lowerSql.includes(op))) {
             return {
                 content: [{
                     type: "text",
-                    text: "⚠️ Error: Data modification operations (DROP, DELETE, UPDATE, TRUNCATE, ALTER) are not allowed for safety reasons."
+                    text: "⚠️ Error: Data modification operations are not allowed for multi-database queries."
                 }],
                 isError: true
             };
         }
 
         try {
+            if (maxDatabases && databaseIds.length > maxDatabases) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Too many databases requested (${databaseIds.length}). Max allowed is ${maxDatabases}.`
+                    }],
+                    isError: true
+                };
+            }
+
+            const requestIdValue = requestId || crypto.randomUUID();
             logger.info(`Executing SQL on multiple databases: ${databaseIds.join(', ')}`);
             const startTime = Date.now();
-            const results = await executeQueryOnMultipleDatabases(sql, databaseIds, parameters);
+            const results = await executeQueryOnMultipleDatabases(sql, databaseIds, parameters, {
+                concurrency,
+                timeoutMs,
+                requestId: requestIdValue
+            });
             const totalTime = Date.now() - startTime;
 
             let responseText = `🔍 Multi-Database Query Results (${results.length} databases)\n\n`;
@@ -394,7 +578,8 @@ function registerDatabaseManagementTools(server, registerWithAllAliases) {
                         totalDatabases: results.length,
                         successfulDatabases: successCount,
                         totalRows,
-                        totalExecutionTime: totalTime
+                        totalExecutionTime: totalTime,
+                        requestId: requestIdValue
                     }
                 }
             };
@@ -425,6 +610,18 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
         databaseId: z.string().optional(),
         outputFile: z.string().optional(),
         outputFormat: z.enum(['json', 'csv']).optional().default('json'),
+        compressOutput: z.boolean().optional().default(false),
+        csvDelimiter: z.string().optional().default(','),
+        csvIncludeHeaders: z.boolean().optional().default(true),
+        csvQuoteChar: z.string().optional().default('"'),
+        timeoutMs: z.number().min(1).max(600000).optional(),
+        dryRun: z.boolean().optional().default(false),
+        approvalToken: z.string().optional(),
+        cacheTtlSeconds: z.number().min(1).max(86400).optional(),
+        requestId: z.string().optional(),
+        maxEstimatedRows: z.number().min(1).max(10000000).optional(),
+        requireWhere: z.boolean().optional().default(false),
+        requireTop: z.boolean().optional().default(false),
         // Pagination parameters
         pageSize: z.number().min(1).max(1000).optional(),
         cursor: z.string().optional(),
@@ -441,46 +638,155 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
             databaseId,
             outputFile,
             outputFormat = 'json',
+            compressOutput = false,
+            csvDelimiter = ',',
+            csvIncludeHeaders = true,
+            csvQuoteChar = '"',
+            timeoutMs,
+            dryRun = false,
+            approvalToken,
+            cacheTtlSeconds,
+            requestId,
+            maxEstimatedRows,
+            requireWhere = false,
+            requireTop = false,
             pageSize,
             cursor,
             cursorField,
             includeCount = false
         } = args;
 
-        // Basic validation to prevent destructive operations
-        const lowerSql = sql.toLowerCase();
-        const prohibitedOperations = ['drop ', 'delete ', 'truncate ', 'update ', 'alter '];
+        const effectiveApprovalToken = approvalToken || extractApprovalToken(args);
+        const effectiveDatabaseId = databaseId || getCurrentDatabaseId();
+        const operationType = classifySqlOperation(sql);
+        const isWrite = operationType === 'dml' || operationType === 'ddl';
+        const isLocal = isLocalDatabase(effectiveDatabaseId);
 
-        if (prohibitedOperations.some(op => lowerSql.includes(op))) {
-            return {
-                content: [{
-                    type: "text",
-                    text: "⚠️ Error: Data modification operations (DROP, DELETE, UPDATE, TRUNCATE, ALTER) are not allowed for safety reasons."
-                }],
-                isError: true
-            };
+        if (isWrite && !isLocal) {
+            if (!effectiveApprovalToken || !validateApprovalToken(effectiveApprovalToken, sql, parameters, effectiveDatabaseId)) {
+                logger.warn(`Write approval rejected for database "${effectiveDatabaseId}" (tokenProvided=${Boolean(effectiveApprovalToken)})`);
+                const approval = createApprovalToken(sql, parameters, effectiveDatabaseId);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Approval required for data-altering query on non-local database. Re-run with approvalToken to proceed.\napprovalToken: ${approval.token}\napprovalExpiresAt: ${new Date(approval.expiresAt).toISOString()}`
+                    }],
+                    isError: true,
+                    result: {
+                        errorCode: "approval_required",
+                        approvalToken: approval.token,
+                        approvalExpiresAt: new Date(approval.expiresAt).toISOString()
+                    }
+                };
+            }
+        }
+
+        if (operationType === 'read') {
+            const normalized = sql.toLowerCase();
+            if (requireWhere && !/\bwhere\b/.test(normalized)) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: "Query rejected: WHERE clause required (requireWhere=true)."
+                    }],
+                    isError: true,
+                    result: {
+                        errorCode: "missing_where"
+                    }
+                };
+            }
+
+            if (requireTop && !/\btop\s+\d+\b/.test(normalized) && !/\bfetch\s+next\s+\d+\s+rows\b/.test(normalized)) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: "Query rejected: TOP or FETCH required (requireTop=true)."
+                    }],
+                    isError: true,
+                    result: {
+                        errorCode: "missing_row_limit"
+                    }
+                };
+            }
         }
 
         try {
+            const requestIdValue = requestId || crypto.randomUUID();
+            const cacheKey = getCacheKey(sql, parameters, effectiveDatabaseId);
+            const cached = readCache(cacheKey, cacheTtlSeconds);
+            if (cached) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: cached.responseText + '\n\n(Cache hit)'
+                    }],
+                    result: {
+                        ...cached.result,
+                        metadata: {
+                            ...cached.result.metadata,
+                            requestId: requestIdValue,
+                            cacheHit: true
+                        }
+                    }
+                };
+            }
+
             // Extract potential table names from query for validation
+            const lowerSql = sql.toLowerCase();
             const tableNameRegex = /\bfrom\s+(\[?[\w_.]+\]?)/gi;
             const matches = [...lowerSql.matchAll(tableNameRegex)];
 
             // Variables for tracking
             let totalCount = null;
 
+            if (maxEstimatedRows) {
+                try {
+                    let countSql = sql;
+                    countSql = countSql.replace(/\s+ORDER\s+BY\s+.+?(?:(?:OFFSET|FETCH|$))/i, ' ');
+                    countSql = countSql.replace(/\s+OFFSET\s+.+?(?:FETCH|$)/i, ' ');
+                    countSql = countSql.replace(/\s+FETCH\s+.+?$/i, ' ');
+                    countSql = `SELECT COUNT(*) AS TotalCount FROM (${countSql}) AS CountQuery`;
+
+                    const countResult = await executeQuery(countSql, parameters, 3, effectiveDatabaseId, timeoutMs);
+                    if (countResult.recordset?.length > 0) {
+                        totalCount = countResult.recordset[0].TotalCount;
+                        if (totalCount > maxEstimatedRows) {
+                            return {
+                                content: [{
+                                    type: "text",
+                                    text: `Estimated row count ${totalCount} exceeds maxEstimatedRows (${maxEstimatedRows}).`
+                                }],
+                                isError: true,
+                                result: {
+                                    errorCode: "max_estimated_rows_exceeded",
+                                    totalCount,
+                                    maxEstimatedRows
+                                }
+                            };
+                        }
+                    }
+                } catch (err) {
+                    logger.warn(`Failed to estimate row count: ${err.message}`);
+                }
+            }
+
             // Execute the query
             logger.info(`Executing SQL: ${sql}`);
             const startTime = Date.now();
-            const result = await executeQuery(sql, parameters, 3, databaseId);
+            const result = await executeQuery(sql, parameters, 3, effectiveDatabaseId, timeoutMs, dryRun);
             const executionTime = Date.now() - startTime;
             const rowCount = result.recordset?.length || 0;
             logger.info(`SQL executed successfully in ${executionTime}ms, returned ${rowCount} rows`);
+            if (executionTime > SLOW_QUERY_MS) {
+                logger.warn(`Slow query (${executionTime}ms) requestId=${requestIdValue}`);
+            }
 
             // Format response for display
             let responseText = '';
 
-            if (rowCount === 0) {
+            if (dryRun) {
+                responseText = `Dry run completed in ${executionTime}ms. Execution plan returned.`;
+            } else if (rowCount === 0) {
                 responseText = "Query executed successfully, but returned no rows.";
             } else {
                 // Basic result summary
@@ -535,27 +841,34 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
                 }
 
                 outputPath = resolvedOutput.path;
+                if (compressOutput && !outputPath.endsWith('.gz')) {
+                    outputPath = `${outputPath}.gz`;
+                }
                 try {
                     if (outputFormat === 'csv') {
                         if (rowCount === 0) {
-                            fs.writeFileSync(outputPath, '');
+                            const emptyBuffer = Buffer.from('');
+                            fs.writeFileSync(outputPath, compressOutput ? zlib.gzipSync(emptyBuffer) : emptyBuffer);
                         } else {
                             const columns = Object.keys(result.recordset[0]);
                             const lines = [];
-                            lines.push(columns.join(','));
+                            if (csvIncludeHeaders) {
+                                lines.push(columns.join(csvDelimiter));
+                            }
 
                             result.recordset.forEach(row => {
                                 const line = columns.map(col => {
                                     const value = row[col];
                                     if (value === null || value === undefined) return '';
-                                    if (typeof value === 'string') return `"${value.replace(/"/g, '""')}"`;
-                                    if (typeof value === 'object') return `"${JSON.stringify(value).replace(/"/g, '""')}"`;
+                                    if (typeof value === 'string') return `${csvQuoteChar}${value.replace(/"/g, '""')}${csvQuoteChar}`;
+                                    if (typeof value === 'object') return `${csvQuoteChar}${JSON.stringify(value).replace(/"/g, '""')}${csvQuoteChar}`;
                                     return String(value);
-                                }).join(',');
+                                }).join(csvDelimiter);
                                 lines.push(line);
                             });
 
-                            fs.writeFileSync(outputPath, lines.join('\n'));
+                            const csvBuffer = Buffer.from(lines.join('\n'));
+                            fs.writeFileSync(outputPath, compressOutput ? zlib.gzipSync(csvBuffer) : csvBuffer);
                         }
                     } else {
                         const resultWithMetadata = {
@@ -568,7 +881,8 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
                             },
                             results: result.recordset || []
                         };
-                        fs.writeFileSync(outputPath, JSON.stringify(resultWithMetadata, null, 2));
+                        const jsonBuffer = Buffer.from(JSON.stringify(resultWithMetadata, null, 2));
+                        fs.writeFileSync(outputPath, compressOutput ? zlib.gzipSync(jsonBuffer) : jsonBuffer);
                     }
 
                     logger.info(`Query results written to ${outputPath}`);
@@ -588,7 +902,7 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
             const uuid = crypto.randomUUID();
 
             // Return both the text response AND the actual data in MCP format
-            return {
+            const response = {
                 content: [{
                     type: "text",
                     text: outputPath
@@ -603,19 +917,39 @@ function registerExecuteQueryTool(server, registerWithAllAliases) {
                         pagination: null,
                         totalCount: totalCount,
                         executionTimeMs: executionTime,
-                        outputPath
+                        outputPath,
+                        requestId: requestIdValue,
+                        cacheHit: false,
+                        dryRun,
+                        operationType,
+                        isLocal
                     }
                 }
             };
+
+            if (cacheTtlSeconds) {
+                writeCache(cacheKey, { responseText, result: response.result });
+            }
+
+            return response;
         } catch (err) {
             logger.error(`SQL execution failed: ${err.message}`);
+
+            const retryableCodes = ['ETIMEOUT', 'ECONNCLOSED', 'ECONNRESET', 'ESOCKET'];
+            const isTimeout = err.message && err.message.toLowerCase().includes('timeout');
+            const retryable = isTimeout || (err.code && retryableCodes.includes(err.code));
+            const errorCode = isTimeout ? 'query_timeout' : 'query_failed';
 
             return {
                 content: [{
                     type: "text",
-                    text: `Error executing query: ${formatSqlError(err)}`
+                    text: `Error executing query: ${formatSqlError(err)}${retryable ? ' (retryable)' : ''}`
                 }],
-                isError: true
+                isError: true,
+                result: {
+                    errorCode,
+                    retryable
+                }
             };
         }
     };
@@ -2131,7 +2465,12 @@ function registerPaginatedQueryTool(server, registerWithAlias) {
         parameters = {},
         includeCount = true,
         direction = 'next',
-        returnTotals = true
+        returnTotals = true,
+        timeoutMs,
+        cacheTtlSeconds,
+        requestId,
+        maxEstimatedRows,
+        compressOutput = false
     }) => {
         // Basic validation to prevent destructive operations
         const lowerSql = sql.toLowerCase();
@@ -2148,6 +2487,26 @@ function registerPaginatedQueryTool(server, registerWithAlias) {
         }
 
         try {
+            const requestIdValue = requestId || crypto.randomUUID();
+            const cacheKey = getCacheKey(sql, parameters, getCurrentDatabaseId());
+            const cached = readCache(cacheKey, cacheTtlSeconds);
+            if (cached) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: cached.responseText + '\n\n(Cache hit)'
+                    }],
+                    result: {
+                        ...cached.result,
+                        metadata: {
+                            ...cached.result.metadata,
+                            requestId: requestIdValue,
+                            cacheHit: true
+                        }
+                    }
+                };
+            }
+
             // Get total count if requested
             let totalCount = null;
             let estimatedTotalPages = null;
@@ -2169,12 +2528,26 @@ function registerPaginatedQueryTool(server, registerWithAlias) {
                     logger.info(`Executing count query: ${countSql}`);
 
                     // Execute count query
-                    const countResult = await executeQuery(countSql, parameters);
+                    const countResult = await executeQuery(countSql, parameters, 3, null, timeoutMs);
 
                     if (countResult.recordset && countResult.recordset.length > 0) {
                         totalCount = countResult.recordset[0].TotalCount;
                         estimatedTotalPages = Math.ceil(totalCount / pageSize);
                         logger.info(`Total count query returned: ${totalCount} rows (${estimatedTotalPages} pages)`);
+                        if (maxEstimatedRows && totalCount > maxEstimatedRows) {
+                            return {
+                                content: [{
+                                    type: "text",
+                                    text: `Estimated row count ${totalCount} exceeds maxEstimatedRows (${maxEstimatedRows}).`
+                                }],
+                                isError: true,
+                                result: {
+                                    errorCode: "max_estimated_rows_exceeded",
+                                    totalCount,
+                                    maxEstimatedRows
+                                }
+                            };
+                        }
                     }
                 } catch (countErr) {
                     logger.warn(`Error executing count query: ${countErr.message}`);
@@ -2201,7 +2574,7 @@ function registerPaginatedQueryTool(server, registerWithAlias) {
             logger.info(`Paginated SQL: ${paginatedSql}`);
 
             // Execute the paginated query
-            const result = await executeQuery(paginatedSql, paginatedParams);
+            const result = await executeQuery(paginatedSql, paginatedParams, 3, null, timeoutMs);
             const rowCount = result.recordset?.length || 0;
 
             // Generate cursors for navigation
@@ -2224,7 +2597,10 @@ function registerPaginatedQueryTool(server, registerWithAlias) {
             // Generate UUID for the output file
             const uuid = crypto.randomUUID();
             const filename = `${uuid}.json`;
-            const filepath = path.join(QUERY_RESULTS_PATH, filename);
+            let filepath = path.join(QUERY_RESULTS_PATH, filename);
+            if (compressOutput) {
+                filepath = `${filepath}.gz`;
+            }
 
             // Add pagination metadata
             const paginationMeta = {
@@ -2255,7 +2631,8 @@ function registerPaginatedQueryTool(server, registerWithAlias) {
                         results: result.recordset || []
                     };
 
-                    fs.writeFileSync(filepath, JSON.stringify(resultWithMetadata, null, 2));
+                    const jsonBuffer = Buffer.from(JSON.stringify(resultWithMetadata, null, 2));
+                    fs.writeFileSync(filepath, compressOutput ? zlib.gzipSync(jsonBuffer) : jsonBuffer);
                     logger.info(`Paginated query results saved to ${filepath}`);
                 } catch (writeError) {
                     logger.error(`Error saving query results to file: ${writeError.message}`);
@@ -2366,7 +2743,7 @@ function registerPaginatedQueryTool(server, registerWithAlias) {
                 markdown += `\`\`\`\n`;
             }
 
-            return {
+            const response = {
                 content: [{
                     type: "text",
                     text: markdown
@@ -2378,19 +2755,36 @@ function registerPaginatedQueryTool(server, registerWithAlias) {
                         uuid: uuid,
                         pagination: paginationMeta,
                         totalCount: totalCount,
-                        executionTimeMs: result.executionTime || 0
+                        executionTimeMs: result.executionTime || 0,
+                        requestId: requestIdValue,
+                        cacheHit: false
                     }
                 }
             };
+
+            if (cacheTtlSeconds) {
+                writeCache(cacheKey, { responseText: markdown, result: response.result });
+            }
+
+            return response;
         } catch (err) {
             logger.error(`Error executing paginated query: ${err.message}`);
+
+            const retryableCodes = ['ETIMEOUT', 'ECONNCLOSED', 'ECONNRESET', 'ESOCKET'];
+            const isTimeout = err.message && err.message.toLowerCase().includes('timeout');
+            const retryable = isTimeout || (err.code && retryableCodes.includes(err.code));
+            const errorCode = isTimeout ? 'query_timeout' : 'query_failed';
 
             return {
                 content: [{
                     type: "text",
                     text: `Error executing paginated query: ${formatSqlError(err)}`
                 }],
-                isError: true
+                isError: true,
+                result: {
+                    errorCode,
+                    retryable
+                }
             };
         }
     };
@@ -2403,7 +2797,12 @@ function registerPaginatedQueryTool(server, registerWithAlias) {
         parameters: z.record(z.any()).optional(),
         includeCount: z.boolean().optional().default(true),
         direction: z.enum(['next', 'prev']).optional().default('next'),
-        returnTotals: z.boolean().optional().default(true)
+        returnTotals: z.boolean().optional().default(true),
+        timeoutMs: z.number().min(1).max(600000).optional(),
+        cacheTtlSeconds: z.number().min(1).max(86400).optional(),
+        requestId: z.string().optional(),
+        maxEstimatedRows: z.number().min(1).max(10000000).optional(),
+        compressOutput: z.boolean().optional().default(false)
     };
 
     if (registerWithAlias) {
@@ -2426,11 +2825,18 @@ function registerQueryStreamerTool(server, registerWithAlias) {
         parameters = {},
         cursorField,
         outputType = 'summary',
-        aggregations
+        aggregations,
+        outputFile,
+        compressOutput = false,
+        csvDelimiter = ',',
+        csvIncludeHeaders = true,
+        csvQuoteChar = '"',
+        timeoutMs,
+        requestId
     }) => {
         // Basic validation to prevent destructive operations
         const lowerSql = sql.toLowerCase();
-        const prohibitedOperations = ['drop ', 'delete ', 'truncate ', 'update ', 'alter '];
+        const prohibitedOperations = ['drop ', 'delete ', 'truncate ', 'update ', 'alter ', 'insert ', 'merge '];
 
         if (prohibitedOperations.some(op => lowerSql.includes(op))) {
             return {
@@ -2488,7 +2894,28 @@ function registerQueryStreamerTool(server, registerWithAlias) {
 
             // UUID for the output file
             const uuid = crypto.randomUUID();
-            const outputPath = path.join(QUERY_RESULTS_PATH, `${uuid}.${outputType === 'csv' ? 'csv' : 'json'}`);
+            let outputPath = null;
+            if (outputFile) {
+                const resolvedOutput = resolveOutputPath(outputFile, outputType === 'csv' ? 'csv' : 'json');
+                if (resolvedOutput?.error) {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Error writing output file: ${resolvedOutput.error}`
+                        }],
+                        isError: true
+                    };
+                }
+                outputPath = resolvedOutput.path;
+                if (compressOutput && !outputPath.endsWith('.gz')) {
+                    outputPath = `${outputPath}.gz`;
+                }
+            } else {
+                outputPath = path.join(QUERY_RESULTS_PATH, `${uuid}.${outputType === 'csv' ? 'csv' : 'json'}`);
+                if (compressOutput) {
+                    outputPath = `${outputPath}.gz`;
+                }
+            }
 
             // Start streaming
             logger.info(`Beginning streaming query execution`);
@@ -2512,7 +2939,7 @@ function registerQueryStreamerTool(server, registerWithAlias) {
 
                 // Execute this batch
                 const batchStartTime = Date.now();
-                const batchResult = await executeQuery(paginatedSql, paginatedParams);
+                const batchResult = await executeQuery(paginatedSql, paginatedParams, 3, null, timeoutMs);
                 const batchTime = Date.now() - batchStartTime;
 
                 const batchRows = batchResult.recordset || [];
@@ -2529,8 +2956,8 @@ function registerQueryStreamerTool(server, registerWithAlias) {
                     headers = Object.keys(batchRows[0]);
 
                     // Initialize CSV with headers if using CSV output
-                    if (outputType === 'csv') {
-                        csvOutput = headers.join(',') + '\n';
+                    if (outputType === 'csv' && csvIncludeHeaders) {
+                        csvOutput = headers.join(csvDelimiter) + '\n';
                     }
                 }
 
@@ -2550,10 +2977,11 @@ function registerQueryStreamerTool(server, registerWithAlias) {
                         batchRows.forEach(row => {
                             const csvRow = headers.map(header => {
                                 const value = row[header];
-                                if (value === null) return '';
-                                if (typeof value === 'string') return `"${value.replace(/"/g, '""')}"`;
+                                if (value === null || value === undefined) return '';
+                                if (typeof value === 'string') return `${csvQuoteChar}${value.replace(/"/g, '""')}${csvQuoteChar}`;
+                                if (typeof value === 'object') return `${csvQuoteChar}${JSON.stringify(value).replace(/"/g, '""')}${csvQuoteChar}`;
                                 return String(value);
-                            }).join(',');
+                            }).join(csvDelimiter);
 
                             csvOutput += csvRow + '\n';
                         });
@@ -2648,10 +3076,12 @@ function registerQueryStreamerTool(server, registerWithAlias) {
                         results: allResults
                     };
 
-                    fs.writeFileSync(outputPath, JSON.stringify(resultWithMetadata, null, 2));
+                    const jsonBuffer = Buffer.from(JSON.stringify(resultWithMetadata, null, 2));
+                    fs.writeFileSync(outputPath, compressOutput ? zlib.gzipSync(jsonBuffer) : jsonBuffer);
                 } else if (outputType === 'csv') {
                     // Save as CSV
-                    fs.writeFileSync(outputPath, csvOutput);
+                    const csvBuffer = Buffer.from(csvOutput);
+                    fs.writeFileSync(outputPath, compressOutput ? zlib.gzipSync(csvBuffer) : csvBuffer);
                 } else {
                     // Save summary if not JSON or CSV
                     const summaryData = {
@@ -2666,7 +3096,8 @@ function registerQueryStreamerTool(server, registerWithAlias) {
                         }
                     };
 
-                    fs.writeFileSync(outputPath, JSON.stringify(summaryData, null, 2));
+                    const summaryBuffer = Buffer.from(JSON.stringify(summaryData, null, 2));
+                    fs.writeFileSync(outputPath, compressOutput ? zlib.gzipSync(summaryBuffer) : summaryBuffer);
                 }
 
                 logger.info(`Streaming query results saved to ${outputPath}`);
@@ -2759,19 +3190,30 @@ function registerQueryStreamerTool(server, registerWithAlias) {
                         batchCount,
                         executionTimeMs: totalTime,
                         outputType,
-                        aggregations: aggregationResults
+                        aggregations: aggregationResults,
+                        outputPath,
+                        requestId: requestId || crypto.randomUUID()
                     }
                 }
             };
         } catch (err) {
             logger.error(`Error executing streaming query: ${err.message}`);
 
+            const retryableCodes = ['ETIMEOUT', 'ECONNCLOSED', 'ECONNRESET', 'ESOCKET'];
+            const isTimeout = err.message && err.message.toLowerCase().includes('timeout');
+            const retryable = isTimeout || (err.code && retryableCodes.includes(err.code));
+            const errorCode = isTimeout ? 'query_timeout' : 'query_failed';
+
             return {
                 content: [{
                     type: "text",
                     text: `Error executing streaming query: ${formatSqlError(err)}`
                 }],
-                isError: true
+                isError: true,
+                result: {
+                    errorCode,
+                    retryable
+                }
             };
         }
     };
@@ -2783,6 +3225,13 @@ function registerQueryStreamerTool(server, registerWithAlias) {
         parameters: z.record(z.any()).optional(),
         cursorField: z.string().optional(),
         outputType: z.enum(['json', 'csv', 'summary']).optional().default('summary'),
+        outputFile: z.string().optional(),
+        compressOutput: z.boolean().optional().default(false),
+        csvDelimiter: z.string().optional().default(','),
+        csvIncludeHeaders: z.boolean().optional().default(true),
+        csvQuoteChar: z.string().optional().default('"'),
+        timeoutMs: z.number().min(1).max(600000).optional(),
+        requestId: z.string().optional(),
         aggregations: z.array(
             z.object({
                 field: z.string(),
